@@ -1,0 +1,64 @@
+name: Build TeaCut.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install pyinstaller imageio-ffmpeg tkinterdnd2
+
+      - name: Build TeaCut.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name TeaCut
+          --icon assets/teacut.ico --add-data "assets/teacut.png;assets"
+          --collect-all imageio_ffmpeg --collect-all tkinterdnd2 teacut.py
+
+      - name: Smoke test the exe (cut, join, repair, convert)
+        shell: pwsh
+        run: |
+          $ff = python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          & $ff -hide_banner -loglevel error -f lavfi -i testsrc=s=320x240:d=6 -f lavfi -i sine=d=6 -c:v wmv2 -c:a wmav2 sample.wmv
+          & $ff -hide_banner -loglevel error -f lavfi -i testsrc2=s=640x360:d=4 -f lavfi -i sine=d=4 -c:v mpeg4 -c:a mp2 sample.avi
+          $exe = "dist\TeaCut.exe"
+          $jobs = @(
+            @("cut", "sample.wmv", "--start", "1", "--end", "4", "-o", "out_cut.wmv"),
+            @("join", "sample.wmv", "sample.avi", "-o", "out_join.mp4"),
+            @("repair", "sample.wmv", "-o", "out_repair.wmv"),
+            @("convert", "sample.wmv", "-o", "out_convert.mp4")
+          )
+          foreach ($a in $jobs) {
+            # A windowed exe returns immediately unless we wait for it.
+            $p = Start-Process -FilePath $exe -ArgumentList $a -Wait -PassThru -NoNewWindow
+            $out = $a[-1]
+            if ($p.ExitCode -ne 0 -or -not (Test-Path $out) -or (Get-Item $out).Length -lt 1024) {
+              throw "TeaCut $($a[0]) failed (exit $($p.ExitCode))"
+            }
+            Write-Host "OK: $($a[0]) -> $out ($((Get-Item $out).Length) bytes)"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TeaCut-windows
+          path: dist/TeaCut.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/TeaCut.exe --title "TeaCut ${{ github.ref_name }}" --generate-notes

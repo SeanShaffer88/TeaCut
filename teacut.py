@@ -713,6 +713,12 @@ def gui():
         root = tk.Tk()
 
     root.title(f"{APP_NAME}")
+    icon = os.path.join(_app_dir(), "assets", "teacut.png")
+    if os.path.isfile(icon):
+        try:
+            root.iconphoto(True, tk.PhotoImage(file=icon))
+        except tk.TclError:
+            pass
     root.minsize(560, 420)
     try:
         root.tk.call("tk", "scaling", max(1.0, root.winfo_fpixels("1i") / 72.0))
@@ -1039,6 +1045,11 @@ def gui():
 
 
 def main():
+    # A windowed .exe has no console; give print() somewhere harmless to go.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
     args = sys.argv[1:]
     if args and args[0] in ("info", "repair", "cut", "join", "convert", "-h", "--help"):
         sys.exit(cli(args))

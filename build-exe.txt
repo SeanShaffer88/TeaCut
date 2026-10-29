@@ -1,6 +1,10 @@
-Make a single double-clickable program (no Python needed on the target PC):
+Ready-made TeaCut.exe downloads are on the GitHub Releases page; they are
+built automatically by .github/workflows/build.yml whenever a version tag
+(v1.0.0, v1.1.0, ...) is pushed.
+
+To build it yourself on Windows (no Python needed on the target PC afterwards):
 
     pip install pyinstaller imageio-ffmpeg tkinterdnd2
-    pyinstaller --onefile --windowed --name TeaCut --collect-all imageio_ffmpeg --collect-all tkinterdnd2 teacut.py
+    pyinstaller --onefile --windowed --name TeaCut --icon assets/teacut.ico --add-data "assets/teacut.png;assets" --collect-all imageio_ffmpeg --collect-all tkinterdnd2 teacut.py
 
-The result is in the dist/ folder.
+The result is dist\TeaCut.exe. (On Mac/Linux, use "assets/teacut.png:assets".)
