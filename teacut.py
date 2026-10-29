@@ -26,7 +26,7 @@ import tempfile
 import threading
 
 APP_NAME = "TeaCut"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
@@ -705,6 +705,12 @@ def gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
+    if sys.platform.startswith("win"):
+        try:  # render crisply on high-DPI screens instead of being bitmap-stretched
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     try:
         from tkinterdnd2 import TkinterDnD, DND_FILES
         root = TkinterDnD.Tk()
@@ -713,13 +719,13 @@ def gui():
         root = tk.Tk()
 
     root.title(f"{APP_NAME}")
-    icon = os.path.join(_app_dir(), "assets", "teacut.png")
-    if os.path.isfile(icon):
-        try:
-            root.iconphoto(True, tk.PhotoImage(file=icon))
-        except tk.TclError:
-            pass
-    root.minsize(560, 420)
+    icons = [os.path.join(_app_dir(), "assets", n) for n in ("teacut.png", "teacut-small.png")]
+    try:
+        root.iconphoto(True, *[tk.PhotoImage(file=i) for i in icons if os.path.isfile(i)])
+    except (tk.TclError, TypeError):
+        pass
+    root.geometry("660x520")
+    root.minsize(600, 480)
     try:
         root.tk.call("tk", "scaling", max(1.0, root.winfo_fpixels("1i") / 72.0))
     except tk.TclError:
@@ -740,6 +746,11 @@ def gui():
         root.destroy()
         return
 
+    def wrapping_label(parent, **kw):
+        label = ttk.Label(parent, justify="left", **kw)
+        label.bind("<Configure>", lambda e: label.configure(wraplength=max(200, e.width - 4)))
+        return label
+
     events = queue.Queue()
     state = {"job": None, "last_output": None}
     filetypes = [("Video files", " ".join(f"*.{e}" for e in VIDEO_EXTENSIONS)
@@ -753,7 +764,7 @@ def gui():
     bottom = ttk.Frame(root, padding=10)
     bottom.pack(fill="x")
     status = tk.StringVar(value="Pick a tab, choose a file, press the big button.")
-    ttk.Label(bottom, textvariable=status, wraplength=520).pack(fill="x")
+    wrapping_label(bottom, textvariable=status).pack(fill="x")
     bar = ttk.Progressbar(bottom, maximum=1000)
     bar.pack(fill="x", pady=6)
     btns = ttk.Frame(bottom)
@@ -840,7 +851,7 @@ def gui():
 
     def big_button(parent, text, cmd):
         b = ttk.Button(parent, text=text, style="Big.TButton", command=cmd)
-        b.pack(side="bottom", pady=(8, 4))
+        b.pack(pady=(18, 4))
         start_buttons.append(b)
         return b
 
@@ -850,7 +861,7 @@ def gui():
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(4, 2))
         name = tk.StringVar(value="No file chosen" + (" - or drop one here" if DND_FILES else ""))
-        details = tk.StringVar()
+        details = tk.StringVar(value="Works with MP4, MKV, AVI, MOV, WMV, ASF, FLV, WebM, MPEG, TS, 3GP and more.")
 
         def set_path(path):
             try:
@@ -869,13 +880,13 @@ def gui():
                 set_path(path)
         ttk.Button(row, text="Choose video...", command=choose).pack(side="left")
         ttk.Label(row, textvariable=name, font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=10)
-        ttk.Label(parent, textvariable=details, style="Hint.TLabel").pack(anchor="w")
+        wrapping_label(parent, textvariable=details, style="Hint.TLabel").pack(fill="x")
         return holder, set_path
 
     def tab(title, hint):
         f = ttk.Frame(notebook, padding=14)
         notebook.add(f, text=title)
-        ttk.Label(f, text=hint, style="Hint.TLabel", wraplength=500, justify="left").pack(anchor="w", pady=(0, 8))
+        wrapping_label(f, text=hint, style="Hint.TLabel").pack(fill="x", pady=(0, 8))
         return f
 
     def need(holder):
@@ -886,13 +897,13 @@ def gui():
 
     # -- Cut ----------------------------------------------------------------
     t_cut = tab("  Cut  ", "Keep just part of a video, or remove a part from the middle. "
-                           "Times can be written like 90, 1:30 or 1:02:03.")
+                           "Times can be written like 90, 1:30 or 1:02:03, and \"end\" means the end of the video.")
     times = ttk.Frame(t_cut)
-    start_var, end_var = tk.StringVar(value="0:00"), tk.StringVar()
+    start_var, end_var = tk.StringVar(value="0:00"), tk.StringVar(value="end")
 
     def on_cut_file(info):
         start_var.set("0:00")
-        end_var.set(format_time(info.duration) if info.duration else "")
+        end_var.set(format_time(info.duration) if info.duration else "end")
     cut_file, cut_set = file_picker(t_cut, on_cut_file)
     times.pack(fill="x", pady=10)
     ttk.Label(times, text="From").pack(side="left")
@@ -903,14 +914,18 @@ def gui():
     ttk.Radiobutton(t_cut, text="Keep this part", variable=mode, value="keep").pack(anchor="w")
     ttk.Radiobutton(t_cut, text="Remove this part (keep the rest)", variable=mode, value="remove").pack(anchor="w")
     exact = tk.BooleanVar(value=False)
-    ttk.Checkbutton(t_cut, text="Frame-exact (slower: re-encodes. Off = instant & lossless, "
-                               "snaps to the nearest keyframe)", variable=exact).pack(anchor="w", pady=(8, 0))
+    ttk.Checkbutton(t_cut, text="Frame-exact cut (slower, re-encodes)", variable=exact).pack(anchor="w", pady=(8, 0))
+    wrapping_label(t_cut, style="Hint.TLabel",
+                   text="Left off, cuts are instant and lossless but start at the nearest keyframe, "
+                        "which can be up to a few seconds early.").pack(fill="x", pady=(4, 0))
 
     def do_cut():
         if not need(cut_file):
             return
         try:
-            a, b = parse_time(start_var.get()), parse_time(end_var.get())
+            a = parse_time(start_var.get())
+            end_text = end_var.get().strip().lower()
+            b = (cut_file["info"].duration or 1e7) if end_text in ("", "end") else parse_time(end_text)
         except ValueError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
@@ -981,8 +996,13 @@ def gui():
                               "stutter, or stop early (broken index, bad timestamps, damaged data).")
     rep_file, rep_set = file_picker(t_rep, lambda info: None)
     deep = tk.BooleanVar(value=False)
-    ttk.Checkbutton(t_rep, text="Deep repair (re-encodes - slower, use if the quick fix wasn't enough)",
+    ttk.Checkbutton(t_rep, text="Deep repair (slower, re-encodes)",
                     variable=deep).pack(anchor="w", pady=(12, 0))
+    wrapping_label(t_rep, style="Hint.TLabel",
+                   text="Quick fix (default): rebuilds the file's structure without touching the picture "
+                        "or sound. Takes seconds and loses no quality.\n"
+                        "Deep repair: decodes everything that can still be read and re-creates the video "
+                        "with fresh timing. For files that still misbehave after the quick fix.").pack(fill="x", pady=(10, 0))
 
     def do_repair():
         if not need(rep_file):

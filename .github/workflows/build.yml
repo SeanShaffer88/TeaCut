@@ -25,7 +25,7 @@ jobs:
       - name: Build TeaCut.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name TeaCut
-          --icon assets/teacut.ico --add-data "assets/teacut.png;assets"
+          --icon assets/teacut.ico --add-data "assets/teacut.png;assets" --add-data "assets/teacut-small.png;assets"
           --collect-all imageio_ffmpeg --collect-all tkinterdnd2 teacut.py
 
       - name: Smoke test the exe (cut, join, repair, convert)
