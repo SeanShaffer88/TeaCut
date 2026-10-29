@@ -26,7 +26,7 @@ import tempfile
 import threading
 
 APP_NAME = "TeaCut"
-VERSION = "1.0"
+VERSION = "1.0.0"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
