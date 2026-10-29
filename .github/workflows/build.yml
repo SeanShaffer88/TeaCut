@@ -3,7 +3,6 @@ name: Build TeaCut.exe
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -57,8 +56,22 @@ jobs:
           name: TeaCut-windows
           path: dist/TeaCut.exe
 
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish release (when VERSION in teacut.py is new)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/TeaCut.exe --title "TeaCut ${{ github.ref_name }}" --generate-notes
+        run: |
+          version=$(python -c "import re; print(re.search(r'^VERSION = \"(.+?)\"', open('teacut.py').read(), re.M).group(1))")
+          tag="v$version"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists - bump VERSION in teacut.py to publish a new one."
+            exit 0
+          fi
+          cat > notes.md <<NOTES
+          ## Download
+          Get **TeaCut.exe** below and double-click it. There's nothing to install, and FFmpeg is built in.
+
+          Windows SmartScreen may warn about an unrecognised app the first time: click *More info → Run anyway*.
+          NOTES
+          gh release create "$tag" dist/TeaCut.exe --target "$GITHUB_SHA" --title "TeaCut $tag" --notes-file notes.md --generate-notes

@@ -1,6 +1,6 @@
 Ready-made TeaCut.exe downloads are on the GitHub Releases page; they are
-built automatically by .github/workflows/build.yml whenever a version tag
-(v1.0.0, v1.1.0, ...) is pushed.
+built automatically by .github/workflows/build.yml: change VERSION in
+teacut.py, push to main, and a new release (v1.1.0, ...) is published.
 
 To build it yourself on Windows (no Python needed on the target PC afterwards):
 

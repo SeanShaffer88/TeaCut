@@ -83,7 +83,7 @@ Times can be written as `90`, `1:30`, `01:02:03.5` or `1m30s`.
 ## Building the exe
 
 Every push is built and tested on Windows by [GitHub Actions](.github/workflows/build.yml);
-pushing a tag like `v1.0.0` publishes a release with `TeaCut.exe` attached.
+changing `VERSION` in `teacut.py` publishes a new release with `TeaCut.exe` attached.
 To build locally, see [build-exe.txt](build-exe.txt).
 
 ## License
