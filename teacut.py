@@ -27,7 +27,7 @@ import tempfile
 import threading
 
 APP_NAME = "TeaCut"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
@@ -761,8 +761,7 @@ def gui():
         root.iconphoto(True, *[tk.PhotoImage(file=i) for i in icons if os.path.isfile(i)])
     except (tk.TclError, TypeError):
         pass
-    root.geometry("660x520")
-    root.minsize(600, 480)
+
     try:
         root.tk.call("tk", "scaling", max(1.0, root.winfo_fpixels("1i") / 72.0))
     except tk.TclError:
@@ -1151,6 +1150,12 @@ def gui():
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
     apply_theme()
+    # Size the window to fit its contents: fonts and DPI scaling differ per PC,
+    # so a fixed size can clip the bottom row.
+    root.update_idletasks()
+    width, height = max(660, root.winfo_reqwidth()), max(520, root.winfo_reqheight())
+    root.geometry(f"{width}x{height}")
+    root.minsize(min(width, 600), height)
     root.after(150, lambda: set_title_bar(dark_mode.get()))
     root.mainloop()
 
