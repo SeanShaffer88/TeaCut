@@ -20,13 +20,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: python -m pip install pyinstaller imageio-ffmpeg tkinterdnd2
+        run: python -m pip install pyinstaller imageio-ffmpeg tkinterdnd2 sv-ttk
 
       - name: Build TeaCut.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name TeaCut
           --icon assets/teacut.ico --add-data "assets/teacut.png;assets" --add-data "assets/teacut-small.png;assets"
-          --collect-all imageio_ffmpeg --collect-all tkinterdnd2 teacut.py
+          --collect-all imageio_ffmpeg --collect-all tkinterdnd2 --collect-all sv_ttk teacut.py
 
       - name: Smoke test the exe (cut, join, repair, convert)
         shell: pwsh

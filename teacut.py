@@ -16,6 +16,7 @@ command-line mode.
 """
 
 import argparse
+import json
 import os
 import queue
 import re
@@ -26,7 +27,7 @@ import tempfile
 import threading
 
 APP_NAME = "TeaCut"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
@@ -701,6 +702,42 @@ def cli(argv):
 # Window
 # ---------------------------------------------------------------------------
 
+def _settings_path():
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "TeaCut", "settings.json")
+
+
+def load_settings():
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        os.makedirs(os.path.dirname(_settings_path()), exist_ok=True)
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except OSError:
+        pass
+
+
+def system_prefers_dark():
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        except OSError:
+            return False
+    if sys.platform == "darwin":
+        return "Dark" in _run_quiet(["defaults", "read", "-g", "AppleInterfaceStyle"]).stdout
+    return False
+
+
 def gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -731,13 +768,53 @@ def gui():
     except tk.TclError:
         pass
     style = ttk.Style()
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
-    elif "aqua" not in style.theme_names() and "clam" in style.theme_names():
-        style.theme_use("clam")
-    style.configure("Big.TButton", font=("TkDefaultFont", 11, "bold"), padding=(18, 8))
-    style.configure("Hint.TLabel", foreground="#666")
-    style.configure("TNotebook.Tab", padding=(16, 6))
+    try:
+        import sv_ttk  # Windows 11 style light/dark theme
+    except ImportError:
+        sv_ttk = None
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        elif "aqua" not in style.theme_names() and "clam" in style.theme_names():
+            style.theme_use("clam")
+    big_style = "Big.Accent.TButton" if sv_ttk else "Big.TButton"
+    settings = load_settings()
+    dark_mode = tk.BooleanVar(value=settings.get("dark", system_prefers_dark()))
+    theme_hooks = []  # extra recolouring for plain-Tk widgets
+
+    def set_title_bar(dark):
+        """Ask Windows 10/11 to draw a dark title bar to match."""
+        if not sys.platform.startswith("win") or not root.winfo_ismapped():
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            value = ctypes.c_int(1 if dark else 0)
+            for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (new, old builds)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                    break
+            w, h = root.winfo_width(), root.winfo_height()
+            root.geometry(f"{w + 1}x{h}")  # nudge so the title bar repaints now
+            root.geometry(f"{w}x{h}")
+        except Exception:
+            pass
+
+    def apply_theme():
+        dark = dark_mode.get()
+        if sv_ttk:
+            sv_ttk.set_theme("dark" if dark else "light")
+        else:
+            style.configure("TNotebook.Tab", padding=(16, 6))
+        # Styles belong to a theme, so these are re-applied after every switch.
+        style.configure(big_style, font=("TkDefaultFont", 11, "bold"), padding=(28, 8))
+        for hook in theme_hooks:
+            hook(dark)
+        set_title_bar(dark)
+
+    def toggle_theme():
+        settings["dark"] = dark_mode.get()
+        save_settings(settings)
+        apply_theme()
 
     try:
         engine = Engine()
@@ -746,8 +823,12 @@ def gui():
         root.destroy()
         return
 
-    def wrapping_label(parent, **kw):
+    def wrapping_label(parent, hint=False, **kw):
         label = ttk.Label(parent, justify="left", **kw)
+        if hint:
+            # Set on the widget itself: the Sun Valley theme ignores a style's text colour.
+            theme_hooks.append(lambda dark: label.configure(
+                foreground=("#a3a3a3" if dark else "#5c5c5c") if sv_ttk else "#666"))
         label.bind("<Configure>", lambda e: label.configure(wraplength=max(200, e.width - 4)))
         return label
 
@@ -775,6 +856,9 @@ def gui():
     open_btn = ttk.Button(btns, text="Show result in folder", state="disabled",
                           command=lambda: reveal(state["last_output"]))
     open_btn.pack(side="right")
+    if sv_ttk:
+        ttk.Checkbutton(btns, text="Dark mode", style="Switch.TCheckbutton",
+                        variable=dark_mode, command=toggle_theme).pack(side="left", expand=True)
 
     start_buttons = []
 
@@ -850,7 +934,7 @@ def gui():
     root.after(80, pump)
 
     def big_button(parent, text, cmd):
-        b = ttk.Button(parent, text=text, style="Big.TButton", command=cmd)
+        b = ttk.Button(parent, text=text, style=big_style, command=cmd)
         b.pack(pady=(18, 4))
         start_buttons.append(b)
         return b
@@ -859,7 +943,7 @@ def gui():
         """A 'Choose video' row. Returns (get_path, set_path)."""
         holder = {"path": None, "info": None}
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(4, 2))
+        row.pack(fill="x", pady=(16, 2))
         name = tk.StringVar(value="No file chosen" + (" - or drop one here" if DND_FILES else ""))
         details = tk.StringVar(value="Works with MP4, MKV, AVI, MOV, WMV, ASF, FLV, WebM, MPEG, TS, 3GP and more.")
 
@@ -880,13 +964,13 @@ def gui():
                 set_path(path)
         ttk.Button(row, text="Choose video...", command=choose).pack(side="left")
         ttk.Label(row, textvariable=name, font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=10)
-        wrapping_label(parent, textvariable=details, style="Hint.TLabel").pack(fill="x")
+        wrapping_label(parent, textvariable=details, hint=True).pack(fill="x")
         return holder, set_path
 
     def tab(title, hint):
         f = ttk.Frame(notebook, padding=14)
         notebook.add(f, text=title)
-        wrapping_label(f, text=hint, style="Hint.TLabel").pack(fill="x", pady=(0, 8))
+        wrapping_label(f, text=hint, hint=True).pack(fill="x", pady=(0, 8))
         return f
 
     def need(holder):
@@ -904,8 +988,7 @@ def gui():
     def on_cut_file(info):
         start_var.set("0:00")
         end_var.set(format_time(info.duration) if info.duration else "end")
-    cut_file, cut_set = file_picker(t_cut, on_cut_file)
-    times.pack(fill="x", pady=10)
+    times.pack(fill="x", pady=(0, 10))
     ttk.Label(times, text="From").pack(side="left")
     ttk.Entry(times, textvariable=start_var, width=12).pack(side="left", padx=6)
     ttk.Label(times, text="to").pack(side="left")
@@ -915,9 +998,10 @@ def gui():
     ttk.Radiobutton(t_cut, text="Remove this part (keep the rest)", variable=mode, value="remove").pack(anchor="w")
     exact = tk.BooleanVar(value=False)
     ttk.Checkbutton(t_cut, text="Frame-exact cut (slower, re-encodes)", variable=exact).pack(anchor="w", pady=(8, 0))
-    wrapping_label(t_cut, style="Hint.TLabel",
+    wrapping_label(t_cut, hint=True,
                    text="Left off, cuts are instant and lossless but start at the nearest keyframe, "
                         "which can be up to a few seconds early.").pack(fill="x", pady=(4, 0))
+    cut_file, cut_set = file_picker(t_cut, on_cut_file)
 
     def do_cut():
         if not need(cut_file):
@@ -939,7 +1023,12 @@ def gui():
                              "join instantly; mismatched ones are converted to match the first.")
     lst_frame = ttk.Frame(t_join)
     lst_frame.pack(fill="both", expand=True)
-    listbox = tk.Listbox(lst_frame, height=7, activestyle="none", selectmode="browse")
+    listbox = tk.Listbox(lst_frame, height=7, activestyle="none", selectmode="browse",
+                         relief="flat", borderwidth=0, highlightthickness=1)
+    theme_hooks.append(lambda dark: listbox.configure(
+        background="#2b2b2b" if dark else "#fdfdfd", foreground="#fafafa" if dark else "#1c1c1c",
+        selectbackground="#57c8ff" if dark else "#005fb8", selectforeground="#000" if dark else "#fff",
+        highlightbackground="#3c3c3c" if dark else "#d6d6d6", highlightcolor="#57c8ff" if dark else "#005fb8"))
     listbox.pack(side="left", fill="both", expand=True)
     join_files = []
     side = ttk.Frame(lst_frame)
@@ -994,15 +1083,15 @@ def gui():
     # -- Repair -------------------------------------------------------------
     t_rep = tab("  Repair  ", "Fixes videos that won't open, can't seek, show the wrong length, "
                               "stutter, or stop early (broken index, bad timestamps, damaged data).")
-    rep_file, rep_set = file_picker(t_rep, lambda info: None)
     deep = tk.BooleanVar(value=False)
     ttk.Checkbutton(t_rep, text="Deep repair (slower, re-encodes)",
                     variable=deep).pack(anchor="w", pady=(12, 0))
-    wrapping_label(t_rep, style="Hint.TLabel",
+    wrapping_label(t_rep, hint=True,
                    text="Quick fix (default): rebuilds the file's structure without touching the picture "
                         "or sound. Takes seconds and loses no quality.\n"
                         "Deep repair: decodes everything that can still be read and re-creates the video "
                         "with fresh timing. For files that still misbehave after the quick fix.").pack(fill="x", pady=(10, 0))
+    rep_file, rep_set = file_picker(t_rep, lambda info: None)
 
     def do_repair():
         if not need(rep_file):
@@ -1017,13 +1106,13 @@ def gui():
     # -- Convert ------------------------------------------------------------
     t_conv = tab("  Convert  ", "Change a video to another format. If the video can simply be moved "
                                 "into the new format, that's instant and lossless; otherwise it's converted.")
-    conv_file, conv_set = file_picker(t_conv, lambda info: None)
     fmt_row = ttk.Frame(t_conv)
-    fmt_row.pack(fill="x", pady=12)
+    fmt_row.pack(fill="x", pady=(0, 4))
     ttk.Label(fmt_row, text="Make it:").pack(side="left")
     labels = [f"{label}  (.{ext})" for ext, (label, _, _) in FORMATS.items()]
     fmt = tk.StringVar(value=labels[0])
     ttk.Combobox(fmt_row, textvariable=fmt, values=labels, state="readonly", width=42).pack(side="left", padx=8)
+    conv_file, conv_set = file_picker(t_conv, lambda info: None)
 
     def do_convert():
         if not need(conv_file):
@@ -1061,6 +1150,8 @@ def gui():
             state["job"].cancel()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
+    apply_theme()
+    root.after(150, lambda: set_title_bar(dark_mode.get()))
     root.mainloop()
 
 

@@ -2,3 +2,5 @@
 imageio-ffmpeg>=0.5
 # Optional: lets you drag files onto the window.
 tkinterdnd2>=0.4
+# Optional: Windows 11 style look with the light/dark switch.
+sv-ttk>=2.6

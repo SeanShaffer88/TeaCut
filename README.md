@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="TeaCut window" width="560">
+  <img src="assets/screenshot.png" alt="TeaCut in light and dark mode" width="820">
 </p>
 
 ---
@@ -45,6 +45,7 @@ underneath, so it opens practically anything:
 * **Lossless first.** Whenever it can, TeaCut copies the video data as-is, with no quality loss. It re-encodes only when there's no other way.
 * **Nothing is overwritten.** Results are saved next to the original, e.g. `holiday_cut.mp4`.
 * **No setup.** The Windows `.exe` has FFmpeg built in. Download it and run it.
+* **Light and dark mode.** A Windows 11 style look that follows your system setting, with a switch to flip it. TeaCut remembers your choice.
 
 ## Download (Windows)
 

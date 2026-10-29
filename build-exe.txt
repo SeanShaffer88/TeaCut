@@ -4,7 +4,7 @@ teacut.py, push to main, and a new release (v1.1.0, ...) is published.
 
 To build it yourself on Windows (no Python needed on the target PC afterwards):
 
-    pip install pyinstaller imageio-ffmpeg tkinterdnd2
-    pyinstaller --onefile --windowed --name TeaCut --icon assets/teacut.ico --add-data "assets/teacut.png;assets" --add-data "assets/teacut-small.png;assets" --collect-all imageio_ffmpeg --collect-all tkinterdnd2 teacut.py
+    pip install pyinstaller imageio-ffmpeg tkinterdnd2 sv-ttk
+    pyinstaller --onefile --windowed --name TeaCut --icon assets/teacut.ico --add-data "assets/teacut.png;assets" --add-data "assets/teacut-small.png;assets" --collect-all imageio_ffmpeg --collect-all tkinterdnd2 --collect-all sv_ttk teacut.py
 
 The result is dist\TeaCut.exe. (On Mac/Linux, use "assets/teacut.png:assets".)
