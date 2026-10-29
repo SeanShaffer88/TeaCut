@@ -33,6 +33,14 @@ underneath, so it opens practically anything:
 > MP4 · MKV · AVI · MOV · WMV · ASF · FLV · WebM · MPEG/MPG · VOB · TS · M2TS/MTS ·
 > 3GP · OGV · RM/RMVB · DV · MXF · DivX/Xvid · raw H.264/H.265 · and many more
 
+## Screenshots
+
+| Cut | Join |
+|:---:|:---:|
+| <img src="assets/win-cut.png" alt="Cut tab" width="400"> | <img src="assets/win-join.png" alt="Join tab" width="400"> |
+| **Repair** | **Convert** |
+| <img src="assets/win-repair.png" alt="Repair tab" width="400"> | <img src="assets/win-convert.png" alt="Convert tab" width="400"> |
+
 ## What it does
 
 | Tab | What it's for |
