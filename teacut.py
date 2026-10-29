@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Steeper Revival - repair, cut and join (almost) any video file.
+TeaCut - repair, cut and join (almost) any video file.
 
 A modern take on the old Steeper / ASFCut tool. The original only handled
 ASF and WMV; this version uses FFmpeg underneath, so it reads anything FFmpeg
@@ -11,7 +11,7 @@ Everything is lossless and near-instant whenever possible (stream copy).
 Only when that is impossible (frame-exact cuts, joining mismatched files,
 badly broken files, incompatible target formats) does it re-encode.
 
-Run with no arguments for the window, or see `steeper.py --help` for the
+Run with no arguments for the window, or see `teacut.py --help` for the
 command-line mode.
 """
 
@@ -25,8 +25,8 @@ import sys
 import tempfile
 import threading
 
-APP_NAME = "Steeper Revival"
-VERSION = "2.0"
+APP_NAME = "TeaCut"
+VERSION = "1.0"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
@@ -109,11 +109,11 @@ SUBTITLE_CONTAINERS = {"mkv"}
 TOLERANT_INPUT = ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt+igndts"]
 
 
-class SteeperError(Exception):
+class TeaCutError(Exception):
     pass
 
 
-class Cancelled(SteeperError):
+class Cancelled(TeaCutError):
     pass
 
 
@@ -187,10 +187,10 @@ class Engine:
     def __init__(self, ffmpeg=None):
         self.ffmpeg = ffmpeg or find_ffmpeg()
         if not self.ffmpeg:
-            raise SteeperError(
+            raise TeaCutError(
                 "FFmpeg was not found.\n\n"
                 "Easiest fix: run  pip install imageio-ffmpeg\n"
-                "or put ffmpeg(.exe) in the same folder as Steeper.")
+                "or put ffmpeg(.exe) in the same folder as TeaCut.")
         self._encoders = None
 
     # -- capabilities -------------------------------------------------------
@@ -210,7 +210,7 @@ class Engine:
     # -- probing ------------------------------------------------------------
     def probe(self, path):
         if not os.path.isfile(path):
-            raise SteeperError(f"File not found: {path}")
+            raise TeaCutError(f"File not found: {path}")
         text = _run_quiet([self.ffmpeg, "-hide_banner", "-i", path]).stderr
         info = MediaInfo(path)
         m = re.search(r"Input #0, ([^,]+)", text)
@@ -239,17 +239,17 @@ class Engine:
                     info.sample_rate, info.channels = int(rate.group(1)), rate.group(2).strip()
         if not (info.has_video or info.has_audio):
             if "Invalid data" in text or "moov atom not found" in text:
-                raise SteeperError(
+                raise TeaCutError(
                     f"{os.path.basename(path)} is too damaged to read at all.\n"
                     "(If it is an MP4/MOV from a camera that lost power, the index is "
                     "missing entirely; a tool like 'untrunc' with a good reference file "
                     "is needed.)")
-            raise SteeperError(f"{os.path.basename(path)} does not look like a video or audio file.")
+            raise TeaCutError(f"{os.path.basename(path)} does not look like a video or audio file.")
         return info
 
     # -- running ------------------------------------------------------------
     def run(self, args, job, total_seconds=0.0, span=(0.0, 1.0)):
-        """Run ffmpeg with progress reporting. Raises SteeperError on failure."""
+        """Run ffmpeg with progress reporting. Raises TeaCutError on failure."""
         cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"] + args
         job.log(" ".join(_quote(a) for a in cmd))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -286,10 +286,10 @@ class Engine:
         if job.cancelled:
             raise Cancelled("Cancelled.")
         if runaway:
-            raise SteeperError("The file's timestamps are broken, so the result was growing far "
+            raise TeaCutError("The file's timestamps are broken, so the result was growing far "
                                "longer than the original. Try Repair with 'Deep repair' ticked.")
         if proc.returncode != 0:
-            raise SteeperError(_summarise_error(err_lines))
+            raise TeaCutError(_summarise_error(err_lines))
         job.progress(start + width)
 
     # -- argument builders --------------------------------------------------
@@ -308,7 +308,7 @@ class Engine:
         if video:
             venc = self.pick_encoder(vchoices) or self.pick_encoder(["libx264", "mpeg4"])
             if not venc:
-                raise SteeperError("This FFmpeg build has no usable video encoder.")
+                raise TeaCutError("This FFmpeg build has no usable video encoder.")
             filters = []
             if retime_fps:
                 filters.append(f"setpts=N/({retime_fps:g}*TB)")
@@ -370,7 +370,7 @@ class Engine:
                 job.log("Lossless rebuild produced an unreadable file; trying a full repair.")
             except Cancelled:
                 raise
-            except SteeperError as e:
+            except TeaCutError as e:
                 job.log(f"Lossless rebuild failed: {e}")
         job.status("Repairing by re-encoding (this takes a while)...")
         self.run(TOLERANT_INPUT + ["-i", src] + self.single_maps()
@@ -391,7 +391,7 @@ class Engine:
                     return dst
             except Cancelled:
                 raise
-            except SteeperError as e:
+            except TeaCutError as e:
                 job.log(f"Lossless change not possible ({e.args[0].splitlines()[0]}); re-encoding.")
         job.status("Converting...")
         self.run(["-i", src] + self.single_maps()
@@ -411,7 +411,7 @@ class Engine:
                     return
             except Cancelled:
                 raise
-            except SteeperError as e:
+            except TeaCutError as e:
                 job.log(f"Lossless cut failed ({e.args[0].splitlines()[0]}); re-encoding.")
         self.run(["-ss", f"{start:.3f}", "-i", src, "-t", f"{length:.3f}"] + self.single_maps()
                  + self.encode_args(ext, info.has_video, info.has_audio) + [dst],
@@ -424,19 +424,19 @@ class Engine:
         start = max(0.0, start)
         end = min(end, dur) if dur else end
         if end <= start:
-            raise SteeperError("The end time must be after the start time.")
+            raise TeaCutError("The end time must be after the start time.")
         if not remove:
             job.status("Cutting..." + (" (frame-exact)" if exact else ""))
             self._cut_piece(src, dst, start, end, info, job, exact, (0.0, 1.0))
             return dst
         pieces = [(a, b) for a, b in ((0.0, start), (end, dur)) if b - a > 0.05]
         if not pieces:
-            raise SteeperError("That would remove the whole video.")
+            raise TeaCutError("That would remove the whole video.")
         if len(pieces) == 1:
             job.status("Cutting...")
             self._cut_piece(src, dst, pieces[0][0], pieces[0][1], info, job, exact, (0.0, 1.0))
             return dst
-        tmp = tempfile.mkdtemp(prefix=".steeper_", dir=os.path.dirname(os.path.abspath(dst)))
+        tmp = tempfile.mkdtemp(prefix=".teacut_", dir=os.path.dirname(os.path.abspath(dst)))
         try:
             parts = []
             total = sum(b - a for a, b in pieces)
@@ -453,7 +453,7 @@ class Engine:
                 self._concat_copy(parts, dst, job, total, (0.8, 0.2))
             except Cancelled:
                 raise
-            except SteeperError:
+            except TeaCutError:
                 # Parts from a keyframe cut can disagree; a re-encoded join always works.
                 self._concat_encode([self.probe(p) for p in parts], dst, job, (0.8, 0.2))
             return dst
@@ -462,7 +462,7 @@ class Engine:
 
     def join(self, sources, dst, job, force_encode=False):
         if len(sources) < 2:
-            raise SteeperError("Add at least two files to join.")
+            raise TeaCutError("Add at least two files to join.")
         job.status("Checking files...")
         infos = [self.probe(s) for s in sources]
         total = sum(i.duration for i in infos)
@@ -475,7 +475,7 @@ class Engine:
                     return dst
             except Cancelled:
                 raise
-            except SteeperError as e:
+            except TeaCutError as e:
                 job.log(f"Lossless join failed ({e.args[0].splitlines()[0]}); re-encoding.")
         elif not same:
             job.log("Files differ in size or format, so they will be re-encoded to match.")
@@ -484,7 +484,7 @@ class Engine:
         return dst
 
     def _concat_copy(self, files, dst, job, total, span):
-        fd, listfile = tempfile.mkstemp(suffix=".txt", prefix="steeper_")
+        fd, listfile = tempfile.mkstemp(suffix=".txt", prefix="teacut_")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 for p in files:
@@ -543,7 +543,7 @@ def _looks_ok(engine, path):
     try:
         engine.probe(path)
         return True
-    except SteeperError:
+    except TeaCutError:
         return False
 
 
@@ -641,7 +641,7 @@ class Job:
 # ---------------------------------------------------------------------------
 
 def cli(argv):
-    p = argparse.ArgumentParser(prog="steeper", description=f"{APP_NAME} {VERSION} - repair, cut and join videos.")
+    p = argparse.ArgumentParser(prog="teacut", description=f"{APP_NAME} {VERSION} - repair, cut and join videos.")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("info", help="show what is inside a file")
     s.add_argument("file")
@@ -670,7 +670,7 @@ def cli(argv):
         sys.stderr.write(f"\r{frac * 100:5.1f}%")
         sys.stderr.flush()
     job = Job(show, lambda t: sys.stderr.write(f"\n{t}\n"),
-              (lambda t: sys.stderr.write(f"\n  {t}\n")) if os.environ.get("STEEPER_DEBUG") else None)
+              (lambda t: sys.stderr.write(f"\n  {t}\n")) if os.environ.get("TEACUT_DEBUG") else None)
     try:
         eng = Engine()
         if a.cmd == "info":
@@ -689,7 +689,7 @@ def cli(argv):
         sys.stderr.write("\n")
         print(f"Saved: {out}")
         return 0
-    except (SteeperError, ValueError) as e:
+    except (TeaCutError, ValueError) as e:
         sys.stderr.write(f"\nError: {e}\n")
         return 1
     except KeyboardInterrupt:
@@ -729,7 +729,7 @@ def gui():
 
     try:
         engine = Engine()
-    except SteeperError as e:
+    except TeaCutError as e:
         messagebox.showerror(APP_NAME, str(e))
         root.destroy()
         return
@@ -849,7 +849,7 @@ def gui():
         def set_path(path):
             try:
                 info = engine.probe(path)
-            except SteeperError as e:
+            except TeaCutError as e:
                 messagebox.showerror(APP_NAME, str(e))
                 return
             holder["path"], holder["info"] = path, info
@@ -934,7 +934,7 @@ def gui():
         for p in paths:
             try:
                 engine.probe(p)
-            except SteeperError as e:
+            except TeaCutError as e:
                 messagebox.showerror(APP_NAME, str(e))
                 continue
             join_files.append(p)

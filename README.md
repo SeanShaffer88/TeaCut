@@ -1,6 +1,6 @@
-# Steeper Revival
+# TeaCut
 
-A remake of the old **Steeper** tool. The original was a small Windows app that
+A revival of the old **Steeper** tool. The original was a small Windows app that
 repaired, cut and joined ASF/WMV files using ASFCut. This version keeps that
 spirit (one small window, a few buttons, instant lossless edits), but because
 it runs on FFmpeg it opens **almost any video file**:
@@ -23,10 +23,10 @@ ever overwritten.
 ## Starting it
 
 1. Install [Python 3](https://www.python.org/downloads/) (on Windows, tick *"Add python.exe to PATH"*).
-2. Double-click **`Steeper (Windows).bat`**, or **`steeper-mac-linux.command`** on Mac/Linux.
+2. Double-click **`TeaCut (Windows).bat`**, or **`teacut-mac-linux.command`** on Mac/Linux.
 
 The first launch downloads a copy of FFmpeg automatically (via `imageio-ffmpeg`).
-If you already have FFmpeg installed, or put `ffmpeg.exe` next to `steeper.py`, that copy is used instead.
+If you already have FFmpeg installed, or put `ffmpeg.exe` next to `teacut.py`, that copy is used instead.
 On Linux you may need the Tk package (`sudo apt install python3-tk`).
 
 To make a standalone `.exe`, see `build-exe.txt`.
@@ -34,11 +34,11 @@ To make a standalone `.exe`, see `build-exe.txt`.
 ## Command line (optional)
 
 ```
-python steeper.py cut video.wmv --start 1:30 --end 2:45 [--remove] [--exact]
-python steeper.py join part1.mp4 part2.mp4 part3.avi -o all.mp4
-python steeper.py repair broken.asf [--deep]
-python steeper.py convert old.wmv -o new.mp4
-python steeper.py info video.mkv
+python teacut.py cut video.wmv --start 1:30 --end 2:45 [--remove] [--exact]
+python teacut.py join part1.mp4 part2.mp4 part3.avi -o all.mp4
+python teacut.py repair broken.asf [--deep]
+python teacut.py convert old.wmv -o new.mp4
+python teacut.py info video.mkv
 ```
 
 ## Limits
