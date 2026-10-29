@@ -1,0 +1,4 @@
+# Bundles a ready-made FFmpeg so nothing else needs installing.
+imageio-ffmpeg>=0.5
+# Optional: lets you drag files onto the window.
+tkinterdnd2>=0.4

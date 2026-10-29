@@ -1,0 +1,6 @@
+Make a single double-clickable program (no Python needed on the target PC):
+
+    pip install pyinstaller imageio-ffmpeg tkinterdnd2
+    pyinstaller --onefile --windowed --name Steeper --collect-all imageio_ffmpeg --collect-all tkinterdnd2 steeper.py
+
+The result is in the dist/ folder.
