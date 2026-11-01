@@ -27,7 +27,7 @@ import tempfile
 import threading
 
 APP_NAME = "TeaCut"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
@@ -149,7 +149,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _run_quiet(args):
-    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    return subprocess.run(args, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW,
                           text=True, encoding="utf-8", errors="replace")
 
@@ -212,7 +212,13 @@ class Engine:
     def probe(self, path):
         if not os.path.isfile(path):
             raise TeaCutError(f"File not found: {path}")
-        text = _run_quiet([self.ffmpeg, "-hide_banner", "-i", path]).stderr
+        result = _run_quiet([self.ffmpeg, "-hide_banner", "-i", path])
+        if result.returncode < 0 or result.returncode > 1:
+            # Negative = killed by a signal (e.g. a segfault in the demuxer).
+            raise TeaCutError(
+                f"FFmpeg crashed while reading {os.path.basename(path)}. "
+                "This FFmpeg build may not support that file's format.")
+        text = result.stderr
         info = MediaInfo(path)
         m = re.search(r"Input #0, ([^,]+)", text)
         if m:
@@ -251,6 +257,14 @@ class Engine:
     # -- running ------------------------------------------------------------
     def run(self, args, job, total_seconds=0.0, span=(0.0, 1.0)):
         """Run ffmpeg with progress reporting. Raises TeaCutError on failure."""
+        # Every call ends with the output path; make its folder first so a
+        # chosen destination doesn't fail with a cryptic FFmpeg error.
+        out = args[-1] if args else ""
+        if out and out != "-" and not out.startswith("-"):
+            try:
+                ensure_parent(out)
+            except OSError as e:
+                raise TeaCutError(f"Cannot create the output folder for {out}: {e}")
         cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"] + args
         job.log(" ".join(_quote(a) for a in cmd))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -562,6 +576,13 @@ def _ext(path):
     return os.path.splitext(path)[1].lstrip(".").lower() or "mkv"
 
 
+def ensure_parent(path):
+    """Create the folder a result will be written to (if it isn't there yet)."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Helpers shared by GUI and CLI
 # ---------------------------------------------------------------------------
@@ -585,13 +606,18 @@ def parse_time(text):
 
 
 def format_time(secs):
-    secs = max(0.0, secs)
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    s_txt = f"{s:06.3f}".rstrip("0").rstrip(".") if s % 1 else f"{int(s):02d}"
-    if len(s_txt.split(".")[0]) < 2:
-        s_txt = "0" + s_txt
-    return f"{int(h)}:{int(m):02d}:{s_txt}" if h else f"{int(m)}:{s_txt}"
+    """Format seconds as 1:02:03.5 (or 2:03.5 under an hour)."""
+    # Round to whole milliseconds first: formatting the float directly can
+    # turn 59.9999 into "0:60" and 3599.9999 into "59:60".
+    total_ms = round(max(0.0, secs) * 1000)
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    if ms:
+        s_txt = f"{s:02d}.{ms:03d}".rstrip("0").rstrip(".")
+    else:
+        s_txt = f"{s:02d}"
+    return f"{h}:{m:02d}:{s_txt}" if h else f"{m}:{s_txt}"
 
 
 def unique_path(path):
@@ -603,9 +629,21 @@ def unique_path(path):
     return candidate
 
 
-def suggest_output(src, tag, ext=None):
+def suggest_output(src, tag, ext=None, outdir=None):
+    """A free '<name>_<tag>.<ext>' path, next to the source or in outdir."""
     base, src_ext = os.path.splitext(src)
-    return unique_path(f"{base}_{tag}.{ext or src_ext.lstrip('.') or 'mkv'}")
+    name = f"{os.path.basename(base)}_{tag}.{ext or src_ext.lstrip('.') or 'mkv'}"
+    folder = outdir or os.path.dirname(os.path.abspath(src))
+    return unique_path(os.path.join(folder, name))
+
+
+def resolve_output(out, src, tag, outdir=None):
+    """Turn a CLI -o value into a path, honouring --output-dir for bare names."""
+    if out:
+        if outdir and not os.path.dirname(out):
+            return os.path.join(outdir, out)
+        return out
+    return suggest_output(src, tag, None, outdir)
 
 
 class Job:
@@ -643,12 +681,14 @@ class Job:
 
 def cli(argv):
     p = argparse.ArgumentParser(prog="teacut", description=f"{APP_NAME} {VERSION} - repair, cut and join videos.")
+    p.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("info", help="show what is inside a file")
     s.add_argument("file")
     s = sub.add_parser("repair", help="fix a broken or unplayable file")
     s.add_argument("file")
-    s.add_argument("-o", "--output")
+    s.add_argument("-o", "--output", help="output file (default: next to the original)")
+    s.add_argument("--output-dir", metavar="DIR", help="save the result in this folder (created if needed)")
     s.add_argument("--deep", action="store_true", help="re-encode instead of trying a lossless rebuild first")
     s = sub.add_parser("cut", help="keep (or remove) a section")
     s.add_argument("file")
@@ -656,14 +696,17 @@ def cli(argv):
     s.add_argument("--end", required=True)
     s.add_argument("--remove", action="store_true", help="remove the section instead of keeping it")
     s.add_argument("--exact", action="store_true", help="frame-exact (re-encodes)")
-    s.add_argument("-o", "--output")
+    s.add_argument("-o", "--output", help="output file (default: next to the original)")
+    s.add_argument("--output-dir", metavar="DIR", help="save the result in this folder (created if needed)")
     s = sub.add_parser("join", help="join files end to end")
     s.add_argument("files", nargs="+")
-    s.add_argument("-o", "--output")
+    s.add_argument("-o", "--output", help="output file (default: next to the first input)")
+    s.add_argument("--output-dir", metavar="DIR", help="save the result in this folder (created if needed)")
     s.add_argument("--reencode", action="store_true")
     s = sub.add_parser("convert", help="change format")
     s.add_argument("file")
     s.add_argument("-o", "--output", required=True, help="output file; its extension picks the format")
+    s.add_argument("--output-dir", metavar="DIR", help="save a bare -o filename in this folder")
     s.add_argument("--reencode", action="store_true")
     a = p.parse_args(argv)
 
@@ -679,14 +722,16 @@ def cli(argv):
             print(f"{a.file}\n  container: {i.container}\n  {i.summary()}")
             return 0
         if a.cmd == "repair":
-            out = eng.repair(a.file, a.output or suggest_output(a.file, "repaired"), job, a.deep)
+            out = eng.repair(a.file, resolve_output(a.output, a.file, "repaired", a.output_dir), job, a.deep)
         elif a.cmd == "cut":
-            out = eng.cut(a.file, a.output or suggest_output(a.file, "cut"),
+            out = eng.cut(a.file, resolve_output(a.output, a.file, "cut", a.output_dir),
                           parse_time(a.start), parse_time(a.end), job, a.remove, a.exact)
         elif a.cmd == "join":
-            out = eng.join(a.files, a.output or suggest_output(a.files[0], "joined"), job, a.reencode)
+            out = eng.join(a.files, resolve_output(a.output, a.files[0], "joined", a.output_dir),
+                           job, a.reencode)
         else:
-            out = eng.convert(a.file, a.output, job, a.reencode)
+            out = eng.convert(a.file, resolve_output(a.output, a.file, "converted", a.output_dir),
+                              job, a.reencode)
         sys.stderr.write("\n")
         print(f"Saved: {out}")
         return 0
@@ -755,7 +800,7 @@ def gui():
         TkinterDnD = DND_FILES = None
         root = tk.Tk()
 
-    root.title(f"{APP_NAME}")
+    root.title(f"{APP_NAME} {VERSION}")
     icons = [os.path.join(_app_dir(), "assets", n) for n in ("teacut.png", "teacut-small.png")]
     try:
         root.iconphoto(True, *[tk.PhotoImage(file=i) for i in icons if os.path.isfile(i)])
@@ -837,12 +882,53 @@ def gui():
                   + " " + " ".join(f"*.{e.upper()}" for e in VIDEO_EXTENSIONS)),
                  ("All files", "*.*")]
 
+    def destination(src, tag, ext=None):
+        """Where a result goes: the chosen folder, or next to the source."""
+        folder = outdir_var.get().strip() if use_outdir.get() else None
+        return suggest_output(src, tag, ext, folder)
+
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
     # -- shared bottom bar ----------------------------------------------------
     bottom = ttk.Frame(root, padding=10)
     bottom.pack(fill="x")
+
+    # Where results go: next to the original, or a folder the user picked.
+    saved_outdir = settings.get("outdir") or ""
+    outdir_var = tk.StringVar(value=saved_outdir)
+    use_outdir = tk.BooleanVar(value=bool(saved_outdir))
+
+    def choose_outdir():
+        path = filedialog.askdirectory(title="Save results in", mustexist=False)
+        if not path:
+            return
+        outdir_var.set(path)
+        use_outdir.set(True)
+        settings["outdir"] = path
+        save_settings(settings)
+
+    def on_use_outdir():
+        if use_outdir.get():
+            if not outdir_var.get().strip():
+                choose_outdir()
+            if use_outdir.get() and outdir_var.get().strip():
+                settings["outdir"] = outdir_var.get().strip()
+                save_settings(settings)
+            else:
+                use_outdir.set(False)
+        else:
+            settings.pop("outdir", None)
+            save_settings(settings)
+
+    out_row = ttk.Frame(bottom)
+    out_row.pack(fill="x", pady=(0, 2))
+    ttk.Checkbutton(out_row, text="Save results in:", variable=use_outdir,
+                    command=on_use_outdir).pack(side="left")
+    ttk.Label(out_row, textvariable=outdir_var, width=38, anchor="w",
+              font=("TkDefaultFont", 9)).pack(side="left", padx=(4, 0))
+    ttk.Button(out_row, text="Choose folder...", command=choose_outdir).pack(side="left", padx=(6, 0))
+
     status = tk.StringVar(value="Pick a tab, choose a file, press the big button.")
     wrapping_label(bottom, textvariable=status).pack(fill="x")
     bar = ttk.Progressbar(bottom, maximum=1000)
@@ -918,7 +1004,7 @@ def gui():
                         bar["value"] = 1000
                         state["last_output"] = val
                         open_btn.state(["!disabled"])
-                        status.set(f"Done! Saved as {os.path.basename(val)}")
+                        status.set(f"Done! Saved to {val}")
                     elif kind == "cancelled":
                         bar["value"] = 0
                         status.set("Cancelled.")
@@ -1013,7 +1099,7 @@ def gui():
             messagebox.showerror(APP_NAME, str(e))
             return
         src = cut_file["path"]
-        dst = suggest_output(src, "cut")
+        dst = destination(src, "cut")
         start(lambda job: engine.cut(src, dst, a, b, job, mode.get() == "remove", exact.get()), "Cutting...")
     big_button(t_cut, "Cut", do_cut)
 
@@ -1030,24 +1116,44 @@ def gui():
         highlightbackground="#3c3c3c" if dark else "#d6d6d6", highlightcolor="#57c8ff" if dark else "#005fb8"))
     listbox.pack(side="left", fill="both", expand=True)
     join_files = []
+    join_infos = []
     side = ttk.Frame(lst_frame)
     side.pack(side="left", fill="y", padx=(8, 0))
 
     def refresh():
         listbox.delete(0, "end")
-        for p in join_files:
-            listbox.insert("end", os.path.basename(p))
+        for p, info in zip(join_files, join_infos):
+            label = os.path.basename(p)
+            if info and info.duration:
+                label += f"  ({format_time(info.duration)})"
+            listbox.insert("end", label)
 
     def add_files(paths=None):
         paths = paths or filedialog.askopenfilenames(title="Add videos", filetypes=filetypes)
         for p in paths:
             try:
-                engine.probe(p)
+                info = engine.probe(p)
             except TeaCutError as e:
                 messagebox.showerror(APP_NAME, str(e))
                 continue
             join_files.append(p)
+            join_infos.append(info)
         refresh()
+
+    def add_folder():
+        folder = filedialog.askdirectory(title="Add all videos in a folder")
+        if not folder:
+            return
+        def natural(name):
+            # part2 before part10
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+        paths = sorted((os.path.join(folder, name) for name in os.listdir(folder)
+                        if os.path.splitext(name)[1].lstrip(".").lower() in VIDEO_EXTENSIONS),
+                       key=lambda p: natural(os.path.basename(p)))
+        if not paths:
+            messagebox.showinfo(APP_NAME, "No videos found in that folder.")
+            return
+        add_files(paths)
 
     def move(delta):
         sel = listbox.curselection()
@@ -1056,18 +1162,27 @@ def gui():
         i, j = sel[0], sel[0] + delta
         if 0 <= j < len(join_files):
             join_files[i], join_files[j] = join_files[j], join_files[i]
+            join_infos[i], join_infos[j] = join_infos[j], join_infos[i]
             refresh()
             listbox.selection_set(j)
 
     def remove_sel():
         sel = listbox.curselection()
         if sel:
-            del join_files[sel[0]]
+            join_files.pop(sel[0])
+            join_infos.pop(sel[0])
             refresh()
+
+    def clear_all():
+        join_files.clear()
+        join_infos.clear()
+        refresh()
     ttk.Button(side, text="Add...", command=add_files).pack(fill="x")
-    ttk.Button(side, text="Remove", command=remove_sel).pack(fill="x", pady=4)
-    ttk.Button(side, text="Move up", command=lambda: move(-1)).pack(fill="x")
-    ttk.Button(side, text="Move down", command=lambda: move(1)).pack(fill="x", pady=4)
+    ttk.Button(side, text="Add folder...", command=add_folder).pack(fill="x", pady=4)
+    ttk.Button(side, text="Remove", command=remove_sel).pack(fill="x")
+    ttk.Button(side, text="Move up", command=lambda: move(-1)).pack(fill="x", pady=4)
+    ttk.Button(side, text="Move down", command=lambda: move(1)).pack(fill="x")
+    ttk.Button(side, text="Clear", command=clear_all).pack(fill="x", pady=4)
 
     def do_join():
         if len(join_files) < 2:
@@ -1075,7 +1190,7 @@ def gui():
             return
         files = list(join_files)
         exts = {_ext(p) for p in files}
-        dst = suggest_output(files[0], "joined", exts.pop() if len(exts) == 1 else "mp4")
+        dst = destination(files[0], "joined", exts.pop() if len(exts) == 1 else "mp4")
         start(lambda job: engine.join(files, dst, job), "Joining...")
     big_button(t_join, "Join", do_join)
 
@@ -1098,7 +1213,7 @@ def gui():
         src = rep_file["path"]
         ext = _ext(src)
         # Damaged MP4/MOV are safest rebuilt into MKV, which tolerates gaps.
-        dst = suggest_output(src, "repaired", ext if ext in FORMATS or ext in ("wmv", "asf") else "mkv")
+        dst = destination(src, "repaired", ext if ext in FORMATS or ext in ("wmv", "asf") else "mkv")
         start(lambda job: engine.repair(src, dst, job, deep.get()), "Repairing...")
     big_button(t_rep, "Repair", do_repair)
 
@@ -1118,7 +1233,7 @@ def gui():
             return
         ext = re.search(r"\(\.(\w+)\)$", fmt.get()).group(1)
         src = conv_file["path"]
-        dst = suggest_output(src, "converted", ext)
+        dst = destination(src, "converted", ext)
         start(lambda job: engine.convert(src, dst, job), "Converting...")
     big_button(t_conv, "Convert", do_convert)
 
@@ -1167,7 +1282,7 @@ def main():
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
     args = sys.argv[1:]
-    if args and args[0] in ("info", "repair", "cut", "join", "convert", "-h", "--help"):
+    if args and args[0] in ("info", "repair", "cut", "join", "convert", "-h", "--help", "--version"):
         sys.exit(cli(args))
     gui()
 
