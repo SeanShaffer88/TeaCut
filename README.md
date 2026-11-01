@@ -46,12 +46,12 @@ underneath, so it opens practically anything:
 | Tab | What it's for |
 |-----|---------------|
 | ✂️ **Cut** | Keep a section, or remove a section and keep the rest. Instant and lossless by default; tick *Frame-exact* to cut on the exact frame. |
-| ➕ **Join** | Put several videos end to end. Matching files join losslessly in seconds. Mismatched files (different sizes, formats, or some without sound) are converted to match automatically. |
+| ➕ **Join** | Put several videos end to end, in the order shown. Matching files join losslessly in seconds; mismatched files (different sizes, formats, or some without sound) are converted to match automatically. Add a whole folder at once, or drop files onto the window. |
 | 🩹 **Repair** | Fixes videos that won't open, can't seek, show the wrong length, stutter or stop early. The quick fix rebuilds the file losslessly; *Deep repair* re-encodes and rebuilds every timestamp for badly damaged files. |
 | 🔄 **Convert** | MP4, MKV, WebM, MOV, AVI, WMV, ASF, MPEG-2, TS, FLV, M4V, 3GP or OGV. Any stream the new format already supports is copied untouched; only the rest is converted. |
 
 * **Lossless first.** Whenever it can, TeaCut copies the video data as-is, with no quality loss. It re-encodes only when there's no other way.
-* **Nothing is overwritten.** Results are saved next to the original, e.g. `holiday_cut.mp4`.
+* **Nothing is overwritten.** Results are saved next to the original, e.g. `holiday_cut.mp4`. Tick *Save results in* at the bottom of the window to put them in a folder of your choice instead (TeaCut remembers it).
 * **No setup.** The Windows `.exe` has FFmpeg built in. Download it and run it.
 * **Light and dark mode.** A Windows 11 style look that follows your system setting, with a switch to flip it. TeaCut remembers your choice.
 
@@ -83,6 +83,25 @@ python teacut.py info video.mkv
 ```
 
 Times can be written as `90`, `1:30`, `01:02:03.5` or `1m30s`.
+Add `--output-dir DIR` to any of the commands that write a file to put the result
+in that folder instead of next to the source (the folder is created if needed).
+With `convert`, a bare `-o name.mp4` is placed in `--output-dir` too.
+
+## Development
+
+Run the test suite (it generates its own tiny videos with FFmpeg, so there are no
+sample files to download):
+
+```
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
+```
+
+The suite covers the time/format helpers, probing, cutting (lossless, frame-exact
+and remove), joining (matching and mismatched files), repairing (including a
+truncated file), converting to the supported formats, and the command line.
+[.github/workflows/tests.yml](.github/workflows/tests.yml) runs it on Linux,
+Windows and macOS for Python 3.11 and 3.12.
 
 ## Limits
 
