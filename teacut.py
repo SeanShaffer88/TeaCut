@@ -25,9 +25,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 APP_NAME = "TeaCut"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Extensions offered in the file picker. FFmpeg reads far more than this;
 # "All files" is always available too.
@@ -77,6 +78,11 @@ AUDIO_ENCODER_ARGS = {
     "wmav2": ["-b:a", "192k"],
     "flac": [],
 }
+# Convert presets. CRF is used where available, otherwise a quality value or
+# a bitrate. "balanced" matches the defaults above.
+QUALITY_CRF = {"smaller": 28, "balanced": 23, "high": 18}
+QUALITY_Q = {"smaller": 5, "balanced": 3, "high": 2}
+QUALITY_BITRATE = {"smaller": "2M", "balanced": "5M", "high": "8M"}
 # Extra per-container flags.
 CONTAINER_ARGS = {
     "mp4": ["-movflags", "+faststart"],
@@ -154,13 +160,34 @@ def _run_quiet(args):
                           text=True, encoding="utf-8", errors="replace")
 
 
+def extract_frame(ffmpeg, src, dst, at_seconds=1.0, width=160):
+    """Save one small PNG frame. Returns dst, or None if there is no video."""
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error",
+           "-ss", f"{max(0.0, at_seconds):.3f}", "-i", src,
+           "-frames:v", "1", "-vf", f"scale={width}:-2", dst, "-y"]
+    try:
+        result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                creationflags=_NO_WINDOW, text=True,
+                                encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if result.returncode != 0 or not os.path.isfile(dst) or os.path.getsize(dst) < 100:
+        return None
+    return dst
+
+
 class MediaInfo:
     def __init__(self, path):
         self.path = path
         self.duration = 0.0
         self.has_video = False
         self.has_audio = False
-        self.vcodec = self.acodec = None
+        self.has_subtitles = False
+        self.vcodec = self.acodec = self.scodec = None
+        self.vcodecs = []
+        self.acodecs = []
+        self.scodecs = []
         self.width = self.height = 0
         self.fps = 0.0
         self.sample_rate = 0
@@ -181,6 +208,8 @@ class MediaInfo:
                 parts.append(f"{self.fps:g} fps")
         if self.has_audio:
             parts.append(f"{self.acodec} audio")
+        if self.has_subtitles:
+            parts.append(f"{self.scodec} subtitles")
         return "  ·  ".join(parts) if parts else "unknown contents"
 
 
@@ -227,23 +256,34 @@ class Engine:
         if m:
             info.duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
         for line in text.splitlines():
-            m = re.search(r"Stream #\d+:\d+.*?: (Video|Audio): (\w+)", line)
+            m = re.search(r"Stream #\d+:\d+.*?: (Video|Audio|Subtitle): (\w+)", line)
             if not m:
                 continue
             kind, codec = m.groups()
-            if kind == "Video" and not info.has_video and "attached pic" not in line:
-                info.has_video, info.vcodec = True, codec
-                size = re.search(r", (\d{2,5})x(\d{2,5})", line)
-                if size:
-                    info.width, info.height = int(size.group(1)), int(size.group(2))
-                fps = re.search(r"([\d.]+) (?:fps|tbr)", line)
-                if fps:
-                    info.fps = float(fps.group(1))
-            elif kind == "Audio" and not info.has_audio:
-                info.has_audio, info.acodec = True, codec
-                rate = re.search(r"(\d+) Hz, ([^,]+)", line)
-                if rate:
-                    info.sample_rate, info.channels = int(rate.group(1)), rate.group(2).strip()
+            if kind == "Video" and "attached pic" not in line:
+                if codec not in info.vcodecs:
+                    info.vcodecs.append(codec)
+                if not info.has_video:
+                    info.has_video, info.vcodec = True, codec
+                    size = re.search(r", (\d{2,5})x(\d{2,5})", line)
+                    if size:
+                        info.width, info.height = int(size.group(1)), int(size.group(2))
+                    fps = re.search(r"([\d.]+) (?:fps|tbr)", line)
+                    if fps:
+                        info.fps = float(fps.group(1))
+            elif kind == "Audio":
+                if codec not in info.acodecs:
+                    info.acodecs.append(codec)
+                if not info.has_audio:
+                    info.has_audio, info.acodec = True, codec
+                    rate = re.search(r"(\d+) Hz, ([^,]+)", line)
+                    if rate:
+                        info.sample_rate, info.channels = int(rate.group(1)), rate.group(2).strip()
+            elif kind == "Subtitle":
+                if codec not in info.scodecs:
+                    info.scodecs.append(codec)
+                if not info.has_subtitles:
+                    info.has_subtitles, info.scodec = True, codec
         if not (info.has_video or info.has_audio):
             if "Invalid data" in text or "moov atom not found" in text:
                 raise TeaCutError(
@@ -280,6 +320,7 @@ class Engine:
         t = threading.Thread(target=drain, daemon=True)
         t.start()
         start, width = span
+        start_wall = time.time()
         runaway = False
         for line in proc.stdout:
             if job.cancelled:
@@ -289,7 +330,11 @@ class Engine:
                     secs = int(line.split("=", 1)[1]) / 1e6
                 except ValueError:
                     continue
-                job.progress(start + width * max(0.0, min(1.0, secs / total_seconds)))
+                elapsed = time.time() - start_wall
+                speed = secs / elapsed if elapsed > 0.05 else 0.0
+                eta = (total_seconds - secs) / speed if speed > 0 else None
+                job.progress(start + width * max(0.0, min(1.0, secs / total_seconds)),
+                             {"done": secs, "total": total_seconds, "speed": speed, "eta": eta})
                 if secs > total_seconds * 2 + 30:
                     runaway = True
                     break
@@ -305,17 +350,30 @@ class Engine:
                                "longer than the original. Try Repair with 'Deep repair' ticked.")
         if proc.returncode != 0:
             raise TeaCutError(_summarise_error(err_lines))
-        job.progress(start + width)
+        job.progress(start + width, {"done": total_seconds, "total": total_seconds,
+                                     "speed": 0.0, "eta": 0.0})
 
     # -- argument builders --------------------------------------------------
-    def copy_args(self, out_ext):
-        maps = ["-map", "0:V?", "-map", "0:a?"]
+    def copy_args(self, out_ext, audio=True):
+        maps = ["-map", "0:V?"]
+        if audio:
+            maps += ["-map", "0:a?"]
         if out_ext in SUBTITLE_CONTAINERS:
             maps += ["-map", "0:s?"]
         faststart = ["-movflags", "+faststart"] if out_ext in ("mp4", "m4v", "mov") else []
         return maps + ["-c", "copy", "-ignore_unknown"] + faststart
 
-    def encode_args(self, out_ext, video=True, audio=True, video_filter=True, retime_fps=None):
+    def reencode_maps(self, out_ext, audio=True):
+        """Maps for a re-encode: every audio track, plus subtitles for MKV."""
+        maps = ["-map", "0:V:0?"]
+        if audio:
+            maps += ["-map", "0:a?"]
+        if out_ext in SUBTITLE_CONTAINERS:
+            maps += ["-map", "0:s?", "-c:s", "copy"]
+        return maps
+
+    def encode_args(self, out_ext, video=True, audio=True, video_filter=True, retime_fps=None,
+                    quality=None, scale_height=None):
         """retime_fps: rebuild all timestamps from scratch (for badly broken files).
         Pass the frame rate, or 0 if unknown."""
         _, vchoices, achoices = FORMATS.get(out_ext, FORMATS["mkv"])
@@ -327,7 +385,10 @@ class Engine:
             filters = []
             if retime_fps:
                 filters.append(f"setpts=N/({retime_fps:g}*TB)")
-            if video_filter:
+            if scale_height:
+                # -2 keeps the aspect ratio and makes the width even.
+                filters.append(f"scale=-2:{scale_height}")
+            elif video_filter:
                 # Most encoders need even dimensions.
                 filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
             if filters:
@@ -336,7 +397,18 @@ class Engine:
                 # Never pad gaps with duplicate frames: broken timestamps can
                 # otherwise turn a 10-second clip into hours of frozen video.
                 args += ["-fps_mode", "cfr" if retime_fps else "vfr"]
-            args += ["-c:v", venc] + VIDEO_ENCODER_ARGS.get(venc, [])
+            venc_args = list(VIDEO_ENCODER_ARGS.get(venc, []))
+            if quality in QUALITY_CRF:
+                crf = QUALITY_CRF[quality]
+                if "-crf" in venc_args:
+                    venc_args[venc_args.index("-crf") + 1] = str(crf)
+                    if venc in ("libvpx", "libvpx-vp9") and "-b:v" in venc_args:
+                        venc_args[venc_args.index("-b:v") + 1] = "0"
+                elif "-q:v" in venc_args:
+                    venc_args[venc_args.index("-q:v") + 1] = str(QUALITY_Q[quality])
+                elif "-b:v" in venc_args:
+                    venc_args[venc_args.index("-b:v") + 1] = QUALITY_BITRATE[quality]
+            args += ["-c:v", venc] + venc_args
         if audio:
             aenc = self.pick_encoder(achoices) or self.pick_encoder(["aac", "libmp3lame", "mp2"])
             if aenc:
@@ -352,24 +424,28 @@ class Engine:
             extra = []
         return args + extra
 
-    def smart_args(self, info, out_ext):
+    def smart_args(self, info, out_ext, mute=False, scale_height=None, quality=None):
         """Copy the streams that already suit out_ext, re-encode only the rest."""
         ok_v, ok_a = NATIVE_CODECS.get(out_ext, (None, None))
-        copy_v = not info.has_video or ok_v is None or info.vcodec in ok_v
-        copy_a = not info.has_audio or ok_a is None or info.acodec in ok_a
-        if copy_v and copy_a:
-            return self.copy_args(out_ext), True
-        args = self.single_maps()
+        copy_v = (not info.has_video or ok_v is None
+                  or all(c in ok_v for c in info.vcodecs))
+        if scale_height and info.height > scale_height:
+            copy_v = False
+        copy_a = (not mute and not info.has_audio or ok_a is None
+                  or all(c in ok_a for c in info.acodecs))
+        if mute:
+            copy_a = False
+        if copy_v and (copy_a or mute):
+            return self.copy_args(out_ext, audio=not mute), True
+        args = self.reencode_maps(out_ext, audio=not mute)
         if info.has_video and copy_v:
             args += ["-c:v", "copy"]
-        if info.has_audio and copy_a:
+        if info.has_audio and copy_a and not mute:
             args += ["-c:a", "copy"]
-        args += self.encode_args(out_ext, info.has_video and not copy_v, info.has_audio and not copy_a)
+        args += self.encode_args(out_ext, info.has_video and not copy_v,
+                                 info.has_audio and not copy_a and not mute,
+                                 quality=quality, scale_height=scale_height)
         return args, False
-
-    @staticmethod
-    def single_maps():
-        return ["-map", "0:V:0?", "-map", "0:a:0?"]
 
     # -- operations ---------------------------------------------------------
     def repair(self, src, dst, job, deep=False):
@@ -388,17 +464,22 @@ class Engine:
             except TeaCutError as e:
                 job.log(f"Lossless rebuild failed: {e}")
         job.status("Repairing by re-encoding (this takes a while)...")
-        self.run(TOLERANT_INPUT + ["-i", src] + self.single_maps()
+        self.run(TOLERANT_INPUT + ["-i", src] + self.reencode_maps(ext)
                  + self.encode_args(ext, info.has_video, info.has_audio,
                                     retime_fps=info.fps if 1 <= info.fps <= 240 else 0) + [dst],
                  job, info.duration)
         return dst
 
-    def convert(self, src, dst, job, force_encode=False):
+    def convert(self, src, dst, job, force_encode=False, quality=None, scale_height=None, mute=False):
         info = self.probe(src)
         ext = _ext(dst)
+        if mute and not info.has_video:
+            raise TeaCutError("There is no video in this file to convert.")
+        if scale_height and info.height and info.height <= scale_height:
+            scale_height = None  # never upscale
         if not force_encode:
-            args, lossless = self.smart_args(info, ext)
+            args, lossless = self.smart_args(info, ext, mute=mute, scale_height=scale_height,
+                                             quality=quality)
             job.status("Changing format (lossless)..." if lossless else "Converting...")
             try:
                 self.run(["-i", src] + args + [dst], job, info.duration)
@@ -409,8 +490,9 @@ class Engine:
             except TeaCutError as e:
                 job.log(f"Lossless change not possible ({e.args[0].splitlines()[0]}); re-encoding.")
         job.status("Converting...")
-        self.run(["-i", src] + self.single_maps()
-                 + self.encode_args(ext, info.has_video, info.has_audio) + [dst],
+        self.run(["-i", src] + self.reencode_maps(ext, audio=not mute)
+                 + self.encode_args(ext, info.has_video, info.has_audio and not mute,
+                                    quality=quality, scale_height=scale_height) + [dst],
                  job, info.duration)
         return dst
 
@@ -428,7 +510,7 @@ class Engine:
                 raise
             except TeaCutError as e:
                 job.log(f"Lossless cut failed ({e.args[0].splitlines()[0]}); re-encoding.")
-        self.run(["-ss", f"{start:.3f}", "-i", src, "-t", f"{length:.3f}"] + self.single_maps()
+        self.run(["-ss", f"{start:.3f}", "-i", src, "-t", f"{length:.3f}"] + self.reencode_maps(ext)
                  + self.encode_args(ext, info.has_video, info.has_audio) + [dst],
                  job, length, span)
 
@@ -474,6 +556,28 @@ class Engine:
             return dst
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def split(self, src, outdir, parts, job, exact=False):
+        """Split a file into N equal parts. Returns the list of output paths."""
+        info = self.probe(src)
+        if parts < 2:
+            raise TeaCutError("Split needs at least 2 parts.")
+        dur = info.duration
+        if not dur or dur <= 0:
+            raise TeaCutError("The file's length is unknown, so it can't be split evenly.")
+        if dur / parts < 0.1:
+            raise TeaCutError("That would make parts shorter than 0.1 seconds.")
+        ext = _ext(src)
+        base = os.path.splitext(os.path.basename(src))[0]
+        paths = []
+        for i in range(parts):
+            a = dur * i / parts
+            b = dur * (i + 1) / parts
+            path = unique_path(os.path.join(outdir, f"{base}_part{i + 1:02d}.{ext}"))
+            job.status(f"Splitting part {i + 1} of {parts}...")
+            self._cut_piece(src, path, a, b, info, job, exact, (i / parts, 1 / parts))
+            paths.append(path)
+        return paths
 
     def join(self, sources, dst, job, force_encode=False):
         if len(sources) < 2:
@@ -654,9 +758,9 @@ class Job:
         self.cancelled = False
         self._p, self._s, self._l = on_progress, on_status, on_log
 
-    def progress(self, frac):
+    def progress(self, frac, info=None):
         if self._p:
-            self._p(frac)
+            self._p(frac, info)
 
     def status(self, text):
         if self._s:
@@ -707,11 +811,30 @@ def cli(argv):
     s.add_argument("file")
     s.add_argument("-o", "--output", required=True, help="output file; its extension picks the format")
     s.add_argument("--output-dir", metavar="DIR", help="save a bare -o filename in this folder")
+    s.add_argument("--quality", choices=["smaller", "balanced", "high"],
+                   help="output quality (default: balanced)")
+    s.add_argument("--scale", type=int, metavar="HEIGHT",
+                   help="downscale to this height (1080, 720, 480); never upscales")
+    s.add_argument("--mute", action="store_true", help="drop the audio")
     s.add_argument("--reencode", action="store_true")
+    s = sub.add_parser("split", help="split a file into equal parts")
+    s.add_argument("file")
+    s.add_argument("--parts", type=int, default=2, help="number of parts (default: 2)")
+    s.add_argument("--exact", action="store_true", help="frame-exact (re-encodes)")
+    s.add_argument("--output-dir", metavar="DIR",
+                   help="save the parts in this folder (default: next to the source)")
     a = p.parse_args(argv)
 
-    def show(frac):
-        sys.stderr.write(f"\r{frac * 100:5.1f}%")
+    def show(frac, info=None):
+        text = f"\r{frac * 100:5.1f}%"
+        if info:
+            eta = info.get("eta")
+            speed = info.get("speed") or 0.0
+            if eta:
+                text += f"  {format_time(eta)} left"
+            if speed >= 0.1:
+                text += f"  {speed:.1f}x"
+        sys.stderr.write(text)
         sys.stderr.flush()
     job = Job(show, lambda t: sys.stderr.write(f"\n{t}\n"),
               (lambda t: sys.stderr.write(f"\n  {t}\n")) if os.environ.get("TEACUT_DEBUG") else None)
@@ -726,12 +849,19 @@ def cli(argv):
         elif a.cmd == "cut":
             out = eng.cut(a.file, resolve_output(a.output, a.file, "cut", a.output_dir),
                           parse_time(a.start), parse_time(a.end), job, a.remove, a.exact)
+        elif a.cmd == "split":
+            outdir = a.output_dir or os.path.dirname(os.path.abspath(a.file))
+            outs = eng.split(a.file, outdir, a.parts, job, a.exact)
+            sys.stderr.write("\n")
+            for out in outs:
+                print(f"Saved: {out}")
+            return 0
         elif a.cmd == "join":
             out = eng.join(a.files, resolve_output(a.output, a.files[0], "joined", a.output_dir),
                            job, a.reencode)
         else:
             out = eng.convert(a.file, resolve_output(a.output, a.file, "converted", a.output_dir),
-                              job, a.reencode)
+                              job, a.reencode, quality=a.quality, scale_height=a.scale, mute=a.mute)
         sys.stderr.write("\n")
         print(f"Saved: {out}")
         return 0
@@ -780,6 +910,24 @@ def system_prefers_dark():
             return False
     if sys.platform == "darwin":
         return "Dark" in _run_quiet(["defaults", "read", "-g", "AppleInterfaceStyle"]).stdout
+    if sys.platform.startswith("linux"):
+        # GNOME / systemd-based desktops.
+        try:
+            out = _run_quiet(["gsettings", "get", "org.gnome.desktop.interface",
+                              "color-scheme"]).stdout
+            if "dark" in out.lower():
+                return True
+        except OSError:
+            pass
+        # GTK 3 fallback.
+        try:
+            path = os.path.join(os.path.expanduser("~"), ".config", "gtk-3.0", "settings.ini")
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().lower().startswith("gtk-application-prefer-dark-theme"):
+                        return "true" in line.lower()
+        except OSError:
+            pass
     return False
 
 
@@ -931,13 +1079,47 @@ def gui():
 
     status = tk.StringVar(value="Pick a tab, choose a file, press the big button.")
     wrapping_label(bottom, textvariable=status).pack(fill="x")
-    bar = ttk.Progressbar(bottom, maximum=1000)
-    bar.pack(fill="x", pady=6)
+    bar_row = ttk.Frame(bottom)
+    bar_row.pack(fill="x", pady=6)
+    bar = ttk.Progressbar(bar_row, maximum=1000)
+    bar.pack(side="left", fill="x", expand=True)
+    progress_var = tk.StringVar(value="")
+    ttk.Label(bar_row, textvariable=progress_var, width=24, anchor="e",
+              font=("TkDefaultFont", 9)).pack(side="left", padx=(8, 0))
+
+    # A small log window makes FFmpeg failures debuggable without a console.
+    log_lines = []
+    log_dialog = {"win": None, "text": None}
+
+    def show_details():
+        win, text = log_dialog["win"], log_dialog["text"]
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.focus()
+                    return
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(root)
+        win.title(f"{APP_NAME} - details")
+        win.geometry("760x420")
+        text = tk.Text(win, wrap="word", height=20, width=90)
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+        dark = dark_mode.get()
+        text.configure(background="#2b2b2b" if dark else "#ffffff",
+                       foreground="#fafafa" if dark else "#1c1c1c",
+                       insertbackground="#fafafa" if dark else "#1c1c1c")
+        text.insert("1.0", "\n".join(log_lines[-400:]))
+        text.configure(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
+        log_dialog["win"], log_dialog["text"] = win, text
+
     btns = ttk.Frame(bottom)
     btns.pack(fill="x")
     cancel_btn = ttk.Button(btns, text="Cancel", state="disabled",
                             command=lambda: state["job"] and state["job"].cancel())
     cancel_btn.pack(side="left")
+    ttk.Button(btns, text="Details", command=show_details).pack(side="left", padx=(8, 0))
     open_btn = ttk.Button(btns, text="Show result in folder", state="disabled",
                           command=lambda: reveal(state["last_output"]))
     open_btn.pack(side="right")
@@ -961,10 +1143,10 @@ def gui():
             messagebox.showerror(APP_NAME, str(e))
 
     def start(work, label):
-        """Run work(job) on a background thread; it returns the output path."""
+        """Run work(job) on a background thread; it returns a path or a list of paths."""
         if state["job"]:
             return
-        job = Job(lambda f: events.put(("progress", f)),
+        job = Job(lambda f, info=None: events.put(("progress", (f, info))),
                   lambda t: events.put(("status", t)),
                   lambda t: events.put(("log", t)))
         state["job"] = job
@@ -973,7 +1155,18 @@ def gui():
         cancel_btn.state(["!disabled"])
         open_btn.state(["disabled"])
         bar["value"] = 0
+        progress_var.set("")
         status.set(label)
+        log_lines.clear()
+        win, text = log_dialog["win"], log_dialog["text"]
+        if win is not None and text is not None:
+            try:
+                if win.winfo_exists():
+                    text.configure(state="normal")
+                    text.delete("1.0", "end")
+                    text.configure(state="disabled")
+            except tk.TclError:
+                pass
 
         def worker():
             try:
@@ -989,22 +1182,60 @@ def gui():
             while True:
                 kind, val = events.get_nowait()
                 if kind == "progress":
-                    bar["value"] = val * 1000
+                    frac, info = val
+                    bar["value"] = frac * 1000
+                    if info:
+                        eta = info.get("eta")
+                        speed = info.get("speed") or 0.0
+                        bits = []
+                        if eta:
+                            bits.append(f"{format_time(eta)} left")
+                        if speed >= 0.1:
+                            bits.append(f"{speed:.1f}x")
+                        progress_var.set(" · ".join(bits))
+                    else:
+                        progress_var.set("")
                 elif kind == "status":
                     status.set(val)
                 elif kind == "log":
-                    pass
+                    log_lines.append(val)
+                    if len(log_lines) > 500:
+                        del log_lines[:-500]
+                    win, text = log_dialog["win"], log_dialog["text"]
+                    if win is not None and text is not None:
+                        try:
+                            if win.winfo_exists():
+                                text.configure(state="normal")
+                                text.insert("end", val + "\n")
+                                text.see("end")
+                                text.configure(state="disabled")
+                        except tk.TclError:
+                            pass
+                elif kind == "batch_status":
+                    src, text = val
+                    batch_statuses[src] = text
+                    refresh_batch()
                 else:
                     job_out = state["job"]
                     state["job"] = None
                     for b in start_buttons:
                         b.state(["!disabled"])
                     cancel_btn.state(["disabled"])
+                    progress_var.set("")
                     if kind == "done":
                         bar["value"] = 1000
-                        state["last_output"] = val
-                        open_btn.state(["!disabled"])
-                        status.set(f"Done! Saved to {val}")
+                        if isinstance(val, (list, tuple)):
+                            if val:
+                                state["last_output"] = val[0]
+                                open_btn.state(["!disabled"])
+                                status.set(f"Done! Saved {len(val)} files to {os.path.dirname(val[0])}")
+                            else:
+                                state["last_output"] = None
+                                status.set("Done! Nothing was written.")
+                        else:
+                            state["last_output"] = val
+                            open_btn.state(["!disabled"])
+                            status.set(f"Done! Saved to {val}")
                     elif kind == "cancelled":
                         bar["value"] = 0
                         status.set("Cancelled.")
@@ -1025,12 +1256,14 @@ def gui():
         return b
 
     def file_picker(parent, on_change):
-        """A 'Choose video' row. Returns (get_path, set_path)."""
-        holder = {"path": None, "info": None}
+        """A 'Choose video' row with a small preview. Returns (get_path, set_path)."""
+        holder = {"path": None, "info": None, "image": None}
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(16, 2))
         name = tk.StringVar(value="No file chosen" + (" - or drop one here" if DND_FILES else ""))
         details = tk.StringVar(value="Works with MP4, MKV, AVI, MOV, WMV, ASF, FLV, WebM, MPEG, TS, 3GP and more.")
+        thumb = ttk.Label(row, text="")
+        thumb_path = os.path.join(tempfile.gettempdir(), f"teacut_thumb_{id(holder)}.png")
 
         def set_path(path):
             try:
@@ -1041,6 +1274,24 @@ def gui():
             holder["path"], holder["info"] = path, info
             name.set(os.path.basename(path))
             details.set(info.summary())
+            try:
+                os.remove(thumb_path)
+            except OSError:
+                pass
+            if info.has_video and engine.ffmpeg:
+                at = min(1.0, info.duration / 2) if info.duration else 0.0
+                extract_frame(engine.ffmpeg, path, thumb_path, at)
+            try:
+                if os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 100:
+                    img = tk.PhotoImage(file=thumb_path)
+                    holder["image"] = img
+                    thumb.configure(image=img, text="")
+                else:
+                    holder["image"] = None
+                    thumb.configure(image="", text="no preview")
+            except tk.TclError:
+                holder["image"] = None
+                thumb.configure(image="", text="no preview")
             on_change(info)
 
         def choose():
@@ -1049,6 +1300,7 @@ def gui():
                 set_path(path)
         ttk.Button(row, text="Choose video...", command=choose).pack(side="left")
         ttk.Label(row, textvariable=name, font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=10)
+        thumb.pack(side="right", padx=(10, 0))
         wrapping_label(parent, textvariable=details, hint=True).pack(fill="x")
         return holder, set_path
 
@@ -1065,7 +1317,7 @@ def gui():
         return True
 
     # -- Cut ----------------------------------------------------------------
-    t_cut = tab("  Cut  ", "Keep just part of a video, or remove a part from the middle. "
+    t_cut = tab("  Cut  ", "Keep just part of a video, remove a part, or split it into equal pieces. "
                            "Times can be written like 90, 1:30 or 1:02:03, and \"end\" means the end of the video.")
     times = ttk.Frame(t_cut)
     start_var, end_var = tk.StringVar(value="0:00"), tk.StringVar(value="end")
@@ -1081,15 +1333,45 @@ def gui():
     mode = tk.StringVar(value="keep")
     ttk.Radiobutton(t_cut, text="Keep this part", variable=mode, value="keep").pack(anchor="w")
     ttk.Radiobutton(t_cut, text="Remove this part (keep the rest)", variable=mode, value="remove").pack(anchor="w")
+    ttk.Radiobutton(t_cut, text="Split into equal parts", variable=mode, value="split").pack(anchor="w")
+    parts_row = ttk.Frame(t_cut)
+    parts_row.pack(fill="x", pady=(4, 0))
+    ttk.Label(parts_row, text="Number of parts:").pack(side="left")
+    parts_var = tk.StringVar(value="2")
+    parts_entry = ttk.Entry(parts_row, textvariable=parts_var, width=6)
+    parts_entry.pack(side="left", padx=6)
+
+    def on_mode(*_):
+        try:
+            parts_entry.configure(state="normal" if mode.get() == "split" else "disabled")
+        except tk.TclError:
+            pass
+    mode.trace_add("write", on_mode)
+    on_mode()
+
     exact = tk.BooleanVar(value=False)
-    ttk.Checkbutton(t_cut, text="Frame-exact cut (slower, re-encodes)", variable=exact).pack(anchor="w", pady=(8, 0))
+    ttk.Checkbutton(t_cut, text="Frame-exact (slower, re-encodes)", variable=exact).pack(anchor="w", pady=(8, 0))
     wrapping_label(t_cut, hint=True,
                    text="Left off, cuts are instant and lossless but start at the nearest keyframe, "
-                        "which can be up to a few seconds early.").pack(fill="x", pady=(4, 0))
+                        "which can be up to a few seconds early. Split writes one file per part.").pack(fill="x", pady=(4, 0))
     cut_file, cut_set = file_picker(t_cut, on_cut_file)
 
     def do_cut():
         if not need(cut_file):
+            return
+        src = cut_file["path"]
+        if mode.get() == "split":
+            try:
+                parts = int(parts_var.get())
+            except ValueError:
+                messagebox.showerror(APP_NAME, "Enter a whole number of parts.")
+                return
+            if parts < 2:
+                messagebox.showerror(APP_NAME, "Split needs at least 2 parts.")
+                return
+            outdir = outdir_var.get().strip() if use_outdir.get() else os.path.dirname(os.path.abspath(src))
+            is_exact = exact.get()
+            start(lambda job: engine.split(src, outdir, parts, job, is_exact), "Splitting...")
             return
         try:
             a = parse_time(start_var.get())
@@ -1098,9 +1380,10 @@ def gui():
         except ValueError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
-        src = cut_file["path"]
         dst = destination(src, "cut")
-        start(lambda job: engine.cut(src, dst, a, b, job, mode.get() == "remove", exact.get()), "Cutting...")
+        remove = mode.get() == "remove"
+        is_exact = exact.get()
+        start(lambda job: engine.cut(src, dst, a, b, job, remove, is_exact), "Cutting...")
     big_button(t_cut, "Cut", do_cut)
 
     # -- Join ---------------------------------------------------------------
@@ -1214,7 +1497,8 @@ def gui():
         ext = _ext(src)
         # Damaged MP4/MOV are safest rebuilt into MKV, which tolerates gaps.
         dst = destination(src, "repaired", ext if ext in FORMATS or ext in ("wmv", "asf") else "mkv")
-        start(lambda job: engine.repair(src, dst, job, deep.get()), "Repairing...")
+        is_deep = deep.get()
+        start(lambda job: engine.repair(src, dst, job, is_deep), "Repairing...")
     big_button(t_rep, "Repair", do_repair)
 
     # -- Convert ------------------------------------------------------------
@@ -1226,6 +1510,18 @@ def gui():
     labels = [f"{label}  (.{ext})" for ext, (label, _, _) in FORMATS.items()]
     fmt = tk.StringVar(value=labels[0])
     ttk.Combobox(fmt_row, textvariable=fmt, values=labels, state="readonly", width=42).pack(side="left", padx=8)
+    opt_row = ttk.Frame(t_conv)
+    opt_row.pack(fill="x", pady=(0, 4))
+    ttk.Label(opt_row, text="Quality:").pack(side="left")
+    quality = tk.StringVar(value="Balanced")
+    ttk.Combobox(opt_row, textvariable=quality, values=["Smaller", "Balanced", "High"],
+                 state="readonly", width=10).pack(side="left", padx=6)
+    ttk.Label(opt_row, text="Size:").pack(side="left", padx=(8, 0))
+    height = tk.StringVar(value="Original")
+    ttk.Combobox(opt_row, textvariable=height, values=["Original", "1080p", "720p", "480p"],
+                 state="readonly", width=10).pack(side="left", padx=6)
+    mute = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opt_row, text="Mute audio", variable=mute).pack(side="left", padx=(8, 0))
     conv_file, conv_set = file_picker(t_conv, lambda info: None)
 
     def do_convert():
@@ -1234,8 +1530,168 @@ def gui():
         ext = re.search(r"\(\.(\w+)\)$", fmt.get()).group(1)
         src = conv_file["path"]
         dst = destination(src, "converted", ext)
-        start(lambda job: engine.convert(src, dst, job), "Converting...")
+        quality_map = {"Smaller": "smaller", "Balanced": "balanced", "High": "high"}
+        height_map = {"Original": None, "1080p": 1080, "720p": 720, "480p": 480}
+        q = quality_map[quality.get()]
+        h = height_map[height.get()]
+        m = mute.get()
+        start(lambda job: engine.convert(src, dst, job, quality=q, scale_height=h, mute=m),
+              "Converting...")
     big_button(t_conv, "Convert", do_convert)
+
+    # -- Batch --------------------------------------------------------------
+    t_batch = tab("  Batch  ", "Convert or repair many files one after another. Results go to the "
+                              "folder chosen at the bottom, or next to each source.")
+    lst_frame = ttk.Frame(t_batch)
+    lst_frame.pack(fill="both", expand=True)
+    batch_list = tk.Listbox(lst_frame, height=8, activestyle="none", selectmode="browse",
+                            relief="flat", borderwidth=0, highlightthickness=1)
+    theme_hooks.append(lambda dark: batch_list.configure(
+        background="#2b2b2b" if dark else "#fdfdfd", foreground="#fafafa" if dark else "#1c1c1c",
+        selectbackground="#57c8ff" if dark else "#005fb8", selectforeground="#000" if dark else "#fff",
+        highlightbackground="#3c3c3c" if dark else "#d6d6d6", highlightcolor="#57c8ff" if dark else "#005fb8"))
+    batch_list.pack(side="left", fill="both", expand=True)
+    batch_side = ttk.Frame(lst_frame)
+    batch_side.pack(side="left", fill="y", padx=(8, 0))
+    batch_files = []
+    batch_statuses = {}
+
+    def refresh_batch():
+        batch_list.delete(0, "end")
+        for p in batch_files:
+            batch_list.insert("end", f"{os.path.basename(p)}  —  {batch_statuses.get(p, 'ready')}")
+
+    def batch_add(paths=None):
+        paths = paths or filedialog.askopenfilenames(title="Add videos", filetypes=filetypes)
+        for p in paths:
+            if p in batch_files:
+                continue
+            try:
+                engine.probe(p)
+            except TeaCutError as e:
+                messagebox.showerror(APP_NAME, str(e))
+                continue
+            batch_files.append(p)
+            batch_statuses[p] = "ready"
+        refresh_batch()
+
+    def batch_add_folder():
+        folder = filedialog.askdirectory(title="Add all videos in a folder")
+        if not folder:
+            return
+        def natural(name):
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+        paths = sorted((os.path.join(folder, name) for name in os.listdir(folder)
+                        if os.path.splitext(name)[1].lstrip(".").lower() in VIDEO_EXTENSIONS),
+                       key=lambda p: natural(os.path.basename(p)))
+        if not paths:
+            messagebox.showinfo(APP_NAME, "No videos found in that folder.")
+            return
+        batch_add(paths)
+
+    def batch_remove():
+        sel = batch_list.curselection()
+        if sel:
+            p = batch_files.pop(sel[0])
+            batch_statuses.pop(p, None)
+            refresh_batch()
+
+    def batch_clear():
+        batch_files.clear()
+        batch_statuses.clear()
+        refresh_batch()
+
+    ttk.Button(batch_side, text="Add files...", command=batch_add).pack(fill="x")
+    ttk.Button(batch_side, text="Add folder...", command=batch_add_folder).pack(fill="x", pady=4)
+    ttk.Button(batch_side, text="Remove", command=batch_remove).pack(fill="x")
+    ttk.Button(batch_side, text="Clear", command=batch_clear).pack(fill="x", pady=4)
+
+    controls = ttk.Frame(t_batch)
+    controls.pack(fill="x", pady=(0, 4))
+    ttk.Label(controls, text="Action:").pack(side="left")
+    batch_action = tk.StringVar(value="Convert")
+    batch_action_box = ttk.Combobox(controls, textvariable=batch_action, values=["Convert", "Repair"],
+                                    state="readonly", width=10)
+    batch_action_box.pack(side="left", padx=6)
+    batch_convert_controls = ttk.Frame(controls)
+    batch_convert_controls.pack(side="left", padx=(8, 0))
+    ttk.Label(batch_convert_controls, text="Make it:").pack(side="left")
+    batch_fmt = tk.StringVar(value=labels[0])
+    ttk.Combobox(batch_convert_controls, textvariable=batch_fmt, values=labels,
+                 state="readonly", width=30).pack(side="left", padx=6)
+    ttk.Label(batch_convert_controls, text="Quality:").pack(side="left", padx=(8, 0))
+    batch_quality = tk.StringVar(value="Balanced")
+    ttk.Combobox(batch_convert_controls, textvariable=batch_quality,
+                 values=["Smaller", "Balanced", "High"], state="readonly", width=10).pack(side="left", padx=6)
+    ttk.Label(batch_convert_controls, text="Size:").pack(side="left", padx=(8, 0))
+    batch_height = tk.StringVar(value="Original")
+    ttk.Combobox(batch_convert_controls, textvariable=batch_height,
+                 values=["Original", "1080p", "720p", "480p"], state="readonly", width=10).pack(side="left", padx=6)
+    batch_mute = tk.BooleanVar(value=False)
+    ttk.Checkbutton(batch_convert_controls, text="Mute audio", variable=batch_mute).pack(side="left", padx=(8, 0))
+    batch_deep_var = tk.BooleanVar(value=False)
+    batch_deep = ttk.Checkbutton(controls, text="Deep repair", variable=batch_deep_var)
+
+    def on_batch_action(*_):
+        if batch_action.get() == "Convert":
+            batch_convert_controls.pack(side="left", padx=(8, 0))
+            batch_deep.pack_forget()
+        else:
+            batch_convert_controls.pack_forget()
+            batch_deep.pack(side="left", padx=(8, 0))
+    batch_action_box.bind("<<ComboboxSelected>>", on_batch_action)
+    on_batch_action()
+
+    def do_batch():
+        if not batch_files:
+            messagebox.showinfo(APP_NAME, "Add some videos first.")
+            return
+        files = list(batch_files)
+        action = batch_action.get()
+        quality_map = {"Smaller": "smaller", "Balanced": "balanced", "High": "high"}
+        height_map = {"Original": None, "1080p": 1080, "720p": 720, "480p": 480}
+        quality = quality_map[batch_quality.get()]
+        height = height_map[batch_height.get()]
+        mute = batch_mute.get()
+        deep = batch_deep_var.get()
+        batch_ext = re.search(r"\(\.(\w+)\)$", batch_fmt.get()).group(1)
+        folder = outdir_var.get().strip() if use_outdir.get() else None
+        for p in files:
+            batch_statuses[p] = "ready"
+        refresh_batch()
+
+        def work(job):
+            results, errors = [], []
+            for i, src in enumerate(files):
+                if job.cancelled:
+                    break
+                batch_statuses[src] = "working"
+                events.put(("batch_status", (src, "working")))
+                job.status(f"File {i + 1} of {len(files)}: {os.path.basename(src)}")
+                try:
+                    if action == "Convert":
+                        dst = suggest_output(src, "converted", batch_ext, folder)
+                        engine.convert(src, dst, job, quality=quality, scale_height=height, mute=mute)
+                    else:
+                        src_ext = _ext(src)
+                        dst = suggest_output(src, "repaired",
+                                             src_ext if src_ext in FORMATS else "mkv", folder)
+                        engine.repair(src, dst, job, deep)
+                    results.append(dst)
+                    batch_statuses[src] = "done"
+                except Cancelled:
+                    raise
+                except Exception as e:
+                    errors.append(f"{os.path.basename(src)}: {e}")
+                    batch_statuses[src] = "error"
+                events.put(("batch_status", (src, batch_statuses[src])))
+            if job.cancelled:
+                raise Cancelled("Cancelled.")
+            if errors:
+                raise TeaCutError(f"{len(errors)} file(s) failed:\n" + "\n".join(errors[:5]))
+            return results
+        start(work, "Batch...")
+    big_button(t_batch, "Start batch", do_batch)
 
     # -- drag & drop (only if tkinterdnd2 is installed) ---------------------
     if DND_FILES:
@@ -1244,6 +1700,8 @@ def gui():
             current = notebook.index(notebook.select())
             if current == 1:
                 add_files(paths)
+            elif current == 4 and paths:
+                batch_add(paths)
             elif paths:
                 (cut_set, None, rep_set, conv_set)[current](paths[0])
         root.drop_target_register(DND_FILES)
@@ -1282,7 +1740,7 @@ def main():
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
     args = sys.argv[1:]
-    if args and args[0] in ("info", "repair", "cut", "join", "convert", "-h", "--help", "--version"):
+    if args and args[0] in ("info", "repair", "cut", "split", "join", "convert", "-h", "--help", "--version"):
         sys.exit(cli(args))
     gui()
 
