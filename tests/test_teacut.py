@@ -55,6 +55,17 @@ def test_format_time_clamps_negative():
     assert teacut.format_time(-5) == "0:00"
 
 
+@pytest.mark.parametrize("secs,expected", [
+    (0, "0:00:00.00"),
+    (4.51, "0:00:04.51"),
+    (18.04, "0:00:18.04"),
+    (59.999, "0:01:00.00"),
+    (3723.5, "1:02:03.50"),
+])
+def test_format_time_long(secs, expected):
+    assert teacut.format_time_long(secs) == expected
+
+
 def test_ext():
     assert teacut._ext("movie.MP4") == "mp4"
     assert teacut._ext("movie") == "mkv"
@@ -186,6 +197,37 @@ def test_cut_creates_output_folder(engine, wmv, tmp_path, job):
     dst = str(tmp_path / "a" / "b" / "out.wmv")
     engine.cut(wmv, dst, 1, 2, job)
     assert os.path.isfile(dst)
+
+
+def test_cut_segments_keep(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "segments.wmv")
+    engine.cut_segments(wmv, dst, [(0, 2), (4, 6)], job)
+    assert os.path.getsize(dst) > 1024
+    assert 3.5 < engine.probe(dst).duration < 5.0
+
+
+def test_cut_segments_remove(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "segments_removed.wmv")
+    engine.cut_segments(wmv, dst, [(2, 4)], job, remove=True)
+    assert os.path.getsize(dst) > 1024
+    assert 3.5 < engine.probe(dst).duration < 5.0
+
+
+def test_cut_segments_single(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "one_segment.wmv")
+    engine.cut_segments(wmv, dst, [(1, 3)], job)
+    assert 1.5 < engine.probe(dst).duration < 3.0
+
+
+def test_cut_segments_remove_all(engine, wmv, tmp_path, job):
+    with pytest.raises(teacut.TeaCutError):
+        engine.cut_segments(wmv, str(tmp_path / "bad.wmv"), [(0, 100)], job, remove=True)
+
+
+def test_complement():
+    assert teacut._complement([(1, 2), (3, 4)], 5) == [(0, 1), (2, 3), (4, 5)]
+    assert teacut._complement([(0, 5)], 5) == []
+    assert teacut._complement([(0, 2), (1, 3)], 4) == [(3, 4)]
 
 
 # ---------------------------------------------------------------------------

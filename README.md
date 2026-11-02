@@ -45,7 +45,7 @@ underneath, so it opens practically anything:
 
 | Tab | What it's for |
 |-----|---------------|
-| ✂️ **Cut** | Keep a section, remove a section and keep the rest, or split a video into equal parts. Instant and lossless by default; tick *Frame-exact* to cut on the exact frame. |
+| ✂️ **Cut** | Build a segment list: keep several parts and join them, or remove parts and keep the rest. Add, edit or split segments, see the total and a timeline, then press *Start*. Split into equal parts or write one file per part. Instant and lossless by default; tick *Frame-exact* to cut on the exact frame. |
 | ➕ **Join** | Put several videos end to end, in the order shown. Matching files join losslessly in seconds; mismatched files (different sizes, formats, or some without sound) are converted to match automatically. Add a whole folder at once, or drop files onto the window. |
 | 🩹 **Repair** | Fixes videos that won't open, can't seek, show the wrong length, stutter or stop early. The quick fix rebuilds the file losslessly; *Deep repair* re-encodes and rebuilds every timestamp for badly damaged files. |
 | 🔄 **Convert** | MP4, MKV, WebM, MOV, AVI, WMV, ASF, MPEG-2, TS, FLV, M4V, 3GP or OGV. Any stream the new format already supports is copied untouched; only the rest is converted. Choose a quality and size, or mute the audio. |
@@ -53,7 +53,8 @@ underneath, so it opens practically anything:
 
 * **Lossless first.** Whenever it can, TeaCut copies the video data as-is, with no quality loss. It re-encodes only when there's no other way.
 * **Nothing is overwritten.** Results are saved next to the original, e.g. `holiday_cut.mp4`. Tick *Save results in* at the bottom of the window to put them in a folder of your choice instead (TeaCut remembers it).
-* **A preview before you commit.** Each file row shows a small frame from the video, so you can check you picked the right one.
+* **A segment list, not a single range.** The Cut tab shows every kept part with its start, end and duration, the total, and a timeline. Add, edit, remove or split segments, then press *Start* to merge them into one file.
+* **A preview before you commit.** Each file row shows a small frame from the video, and the Cut tab previews the selected segment.
 * **No setup.** The Windows `.exe` has FFmpeg built in. Download it and run it.
 * **Light and dark mode.** A Windows 11 style look that follows your system setting, with a switch to flip it. TeaCut remembers your choice.
 * **Progress you can read.** The bar shows time remaining and speed (e.g. `0:12 left · 2.3x`), and *Details* opens the FFmpeg log if something goes wrong.

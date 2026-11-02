@@ -177,6 +177,19 @@ def extract_frame(ffmpeg, src, dst, at_seconds=1.0, width=160):
     return dst
 
 
+def _complement(segments, duration):
+    """The gaps left when the given segments are removed from [0, duration]."""
+    result = []
+    cursor = 0.0
+    for a, b in sorted(segments):
+        if a > cursor:
+            result.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < duration:
+        result.append((cursor, duration))
+    return [(a, b) for a, b in result if b - a > 0.05]
+
+
 class MediaInfo:
     def __init__(self, path):
         self.path = path
@@ -557,6 +570,51 @@ class Engine:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def cut_segments(self, src, dst, segments, job, exact=False, remove=False):
+        """Keep several [start, end] sections and join them into one file.
+
+        With remove=True the sections are thrown away and the rest is kept.
+        """
+        info = self.probe(src)
+        dur = info.duration or max((b for a, b in segments), default=0.0)
+        segs = []
+        for a, b in segments:
+            a = max(0.0, min(a, dur))
+            b = max(0.0, min(b, dur))
+            if b - a > 0.05:
+                segs.append((a, b))
+        if remove:
+            segs = _complement(segs, dur)
+        if not segs:
+            raise TeaCutError("That would remove the whole video.")
+        if len(segs) == 1:
+            job.status("Cutting..." + (" (frame-exact)" if exact else ""))
+            self._cut_piece(src, dst, segs[0][0], segs[0][1], info, job, exact, (0.0, 1.0))
+            return dst
+        tmp = tempfile.mkdtemp(prefix=".teacut_", dir=os.path.dirname(os.path.abspath(dst)))
+        try:
+            parts = []
+            total = sum(b - a for a, b in segs)
+            done = 0.0
+            for i, (a, b) in enumerate(segs):
+                job.status(f"Cutting part {i + 1} of {len(segs)}...")
+                part = os.path.join(tmp, f"part{i}.{_ext(dst)}")
+                span = (0.8 * done / total, 0.8 * (b - a) / total)
+                self._cut_piece(src, part, a, b, info, job, exact, span)
+                parts.append(part)
+                done += b - a
+            job.status("Putting the parts back together...")
+            try:
+                self._concat_copy(parts, dst, job, total, (0.8, 0.2))
+            except Cancelled:
+                raise
+            except TeaCutError:
+                # Parts from a keyframe cut can disagree; a re-encoded join always works.
+                self._concat_encode([self.probe(p) for p in parts], dst, job, (0.8, 0.2))
+            return dst
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def split(self, src, outdir, parts, job, exact=False):
         """Split a file into N equal parts. Returns the list of output paths."""
         info = self.probe(src)
@@ -722,6 +780,15 @@ def format_time(secs):
     else:
         s_txt = f"{s:02d}"
     return f"{h}:{m:02d}:{s_txt}" if h else f"{m}:{s_txt}"
+
+
+def format_time_long(secs):
+    """Format seconds as 0:00:04.51 - the compact form used in segment lists."""
+    total_cs = round(max(0.0, secs) * 100)
+    h, rem = divmod(total_cs, 360_000)
+    m, rem = divmod(rem, 6_000)
+    s, cs = divmod(rem, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
 def unique_path(path):
@@ -933,7 +1000,7 @@ def system_prefers_dark():
 
 def gui():
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 
     if sys.platform.startswith("win"):
         try:  # render crisply on high-DPI screens instead of being bitmap-stretched
@@ -999,6 +1066,9 @@ def gui():
             style.configure("TNotebook.Tab", padding=(16, 6))
         # Styles belong to a theme, so these are re-applied after every switch.
         style.configure(big_style, font=("TkDefaultFont", 11, "bold"), padding=(28, 8))
+        style.configure("Segment.Treeview", rowheight=26)
+        style.configure("Segment.Treeview.Heading",
+                        font=("TkDefaultFont", 9, "bold"), padding=(4, 4))
         for hook in theme_hooks:
             hook(dark)
         set_title_bar(dark)
@@ -1317,74 +1387,306 @@ def gui():
         return True
 
     # -- Cut ----------------------------------------------------------------
-    t_cut = tab("  Cut  ", "Keep just part of a video, remove a part, or split it into equal pieces. "
-                           "Times can be written like 90, 1:30 or 1:02:03, and \"end\" means the end of the video.")
-    times = ttk.Frame(t_cut)
-    start_var, end_var = tk.StringVar(value="0:00"), tk.StringVar(value="end")
+    t_cut = tab("  Cut  ", "Keep several parts and join them, or remove parts and keep the rest. "
+                           "Add segments, split the video into equal parts, then press Start.")
+    segments = []
+    selected = {"index": 0}
+    seg_count_var = tk.StringVar(value="Segment list (0)")
+    total_var = tk.StringVar(value="Total 0:00")
+    cut_name_var = tk.StringVar(value="")
+
+    header = ttk.Frame(t_cut)
+    ttk.Label(header, textvariable=seg_count_var,
+              font=("TkDefaultFont", 10, "bold")).pack(side="left")
+    ttk.Label(header, textvariable=total_var).pack(side="right")
+    ttk.Label(header, textvariable=cut_name_var,
+              font=("TkDefaultFont", 9)).pack(side="right", padx=(10, 0))
+
+    main = ttk.Frame(t_cut)
+    list_frame = ttk.Frame(main)
+    segments_tree = ttk.Treeview(list_frame, columns=("start", "end", "duration"),
+                                 show="tree headings", height=6, selectmode="browse",
+                                 style="Segment.Treeview")
+    segments_tree.heading("#0", text="#")
+    segments_tree.column("#0", width=32, anchor="center")
+    for col, text, width in (("start", "Start", 105), ("end", "End", 105),
+                             ("duration", "Duration", 105)):
+        segments_tree.heading(col, text=text)
+        segments_tree.column(col, width=width, anchor="w")
+    segments_tree.pack(side="left", fill="both", expand=True)
+    seg_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=segments_tree.yview)
+    segments_tree.configure(yscrollcommand=seg_scroll.set)
+    seg_scroll.pack(side="left", fill="y")
+    def style_segment_tags(dark):
+        segments_tree.tag_configure("odd", background="#f4f4f4" if not dark else "#2a2a2a")
+        segments_tree.tag_configure("even", background="#ffffff" if not dark else "#232323")
+    theme_hooks.append(style_segment_tags)
+    segments_tree.bind("<<TreeviewSelect>>", lambda e: on_segment_select())
+    segments_tree.bind("<Double-1>", lambda e: edit_segment())
+
+    preview_frame = ttk.Frame(main, padding=(8, 0, 0, 0))
+    preview_label = ttk.Label(preview_frame, text="No preview", anchor="center", width=30)
+    preview_label.pack(pady=(0, 4))
+    preview_info = ttk.Label(preview_frame, text="", font=("TkDefaultFont", 9))
+    preview_info.pack()
+
+    timeline = tk.Canvas(t_cut, height=46, highlightthickness=0)
+    timeline.bind("<Configure>", lambda e: redraw_timeline())
+    timeline.bind("<Button-1>", lambda e: on_timeline_click(e))
+
+    btns_cut = ttk.Frame(t_cut)
+    checks_cut = ttk.Frame(t_cut)
+    exact = tk.BooleanVar(value=False)
+    remove_mode = tk.BooleanVar(value=False)
+
+    def refresh_segments():
+        segments_tree.delete(*segments_tree.get_children())
+        for i, (a, b) in enumerate(segments):
+            segments_tree.insert("", "end", iid=str(i), text=str(i + 1),
+                                 values=(format_time_long(a), format_time_long(b),
+                                         format_time_long(b - a)),
+                                 tags=("odd" if i % 2 else "even"))
+        if segments:
+            if selected["index"] >= len(segments):
+                selected["index"] = len(segments) - 1
+            segments_tree.selection_set(str(selected["index"]))
+            segments_tree.focus(str(selected["index"]))
+        seg_count_var.set(f"Segment list ({len(segments)})")
+        total_var.set(f"Total {format_time_long(sum(b - a for a, b in segments))}")
+        redraw_timeline()
+
+    def update_preview():
+        if not segments or not cut_file["path"]:
+            preview_label.configure(image="", text="No preview")
+            preview_info.configure(text="")
+            return
+        i = min(selected["index"], len(segments) - 1)
+        a, b = segments[i]
+        at = a + min(1.0, max(0.0, (b - a) / 2))
+        path = os.path.join(tempfile.gettempdir(), f"teacut_seg_{os.getpid()}_{i}.png")
+        old = getattr(preview_label, "image_path", None)
+        if extract_frame(engine.ffmpeg, cut_file["path"], path, at, width=240):
+            try:
+                img = tk.PhotoImage(file=path)
+                preview_label.configure(image=img, text="")
+                preview_label.image = img
+                preview_label.image_path = path
+            except tk.TclError:
+                preview_label.configure(image="", text="No preview")
+        else:
+            preview_label.configure(image="", text="No preview")
+        if old and old != path:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        preview_info.configure(text=f"{format_time_long(a)} - {format_time_long(b)}")
+
+    def redraw_timeline():
+        timeline.delete("all")
+        w = max(timeline.winfo_width(), 240)
+        dark = dark_mode.get()
+        bg = "#1e1e1e" if dark else "#f3f3f3"
+        fg = "#bdbdbd" if dark else "#555555"
+        timeline.configure(background=bg)
+        timeline.create_line(8, 20, w - 8, 20,
+                             fill="#3a3a3a" if dark else "#d0d0d0", width=12)
+        if not segments:
+            timeline.create_text(w / 2, 38, text="Add a segment to see the timeline", fill=fg)
+            return
+        total = sum(b - a for a, b in segments)
+        if total <= 0:
+            return
+        x = 8
+        usable = w - 16
+        for i, (a, b) in enumerate(segments):
+            seg_w = max(2.0, (b - a) / total * usable)
+            color = "#57c8ff" if i == selected["index"] else "#2b7bb9"
+            timeline.create_rectangle(x, 14, x + seg_w, 26, fill=color, outline="")
+            x += seg_w
+        timeline.create_text(8, 38, text="0:00:00.00", anchor="w", fill=fg)
+        timeline.create_text(w - 8, 38, text=format_time_long(total), anchor="e", fill=fg)
+
+    theme_hooks.append(lambda dark: redraw_timeline())
+
+    def on_segment_select():
+        sel = segments_tree.selection()
+        if sel:
+            selected["index"] = int(sel[0])
+            update_preview()
+            redraw_timeline()
+
+    def on_timeline_click(event):
+        if not segments:
+            return
+        w = max(timeline.winfo_width(), 240)
+        usable = w - 16
+        pos = max(0.0, min(1.0, (event.x - 8) / usable)) * sum(b - a for a, b in segments)
+        acc = 0.0
+        for i, (a, b) in enumerate(segments):
+            if pos <= acc + (b - a):
+                selected["index"] = i
+                segments_tree.selection_set(str(i))
+                update_preview()
+                redraw_timeline()
+                return
+            acc += b - a
+
+    def add_segment():
+        if not cut_file["path"]:
+            messagebox.showinfo(APP_NAME, "Choose a video first.")
+            return
+        dur = cut_file["info"].duration
+        if not dur:
+            messagebox.showinfo(APP_NAME, "This file's length is unknown.")
+            return
+        # Fill the first gap in the list, or the rest of the video.
+        gap_start = gap_end = None
+        cursor = 0.0
+        for a, b in sorted(segments):
+            if a > cursor + 0.05:
+                gap_start, gap_end = cursor, a
+                break
+            cursor = max(cursor, b)
+        if gap_start is None:
+            if cursor < dur - 0.05:
+                gap_start, gap_end = cursor, dur
+            else:
+                messagebox.showinfo(APP_NAME, "The whole video is already in the list.")
+                return
+        end = min(gap_end, gap_start + 30.0)
+        if end - gap_start < 0.1:
+            end = gap_end
+        segments.append([gap_start, end])
+        selected["index"] = len(segments) - 1
+        refresh_segments()
+        update_preview()
+
+    def edit_segment():
+        if not segments:
+            return
+        i = min(selected["index"], len(segments) - 1)
+        a, b = segments[i]
+        dialog = tk.Toplevel(root)
+        dialog.title("Edit segment")
+        dialog.transient(root)
+        dialog.grab_set()
+        row = ttk.Frame(dialog, padding=10)
+        row.pack(fill="both", expand=True)
+        ttk.Label(row, text="Start").pack(side="left")
+        start_var = tk.StringVar(value=format_time_long(a))
+        ttk.Entry(row, textvariable=start_var, width=12).pack(side="left", padx=6)
+        ttk.Label(row, text="End").pack(side="left")
+        end_var = tk.StringVar(value=format_time_long(b))
+        ttk.Entry(row, textvariable=end_var, width=12).pack(side="left", padx=6)
+
+        def ok():
+            try:
+                na, nb = parse_time(start_var.get()), parse_time(end_var.get())
+            except ValueError as e:
+                messagebox.showerror(APP_NAME, str(e))
+                return
+            if nb <= na:
+                messagebox.showerror(APP_NAME, "The end must be after the start.")
+                return
+            segments[i] = [max(0.0, na), nb]
+            dialog.destroy()
+            refresh_segments()
+            update_preview()
+        ttk.Button(row, text="OK", command=ok).pack(side="left", padx=6)
+        dialog.bind("<Return>", lambda e: ok())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.update_idletasks()
+        x = root.winfo_x() + (root.winfo_width() - dialog.winfo_width()) // 2
+        y = root.winfo_y() + (root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def remove_segment():
+        if not segments:
+            return
+        i = min(selected["index"], len(segments) - 1)
+        del segments[i]
+        if selected["index"] >= len(segments):
+            selected["index"] = max(0, len(segments) - 1)
+        refresh_segments()
+        update_preview()
+
+    def split_equal():
+        if not cut_file["path"]:
+            messagebox.showinfo(APP_NAME, "Choose a video first.")
+            return
+        dur = cut_file["info"].duration
+        if not dur:
+            messagebox.showinfo(APP_NAME, "This file's length is unknown.")
+            return
+        n = simpledialog.askinteger("Split into equal parts", "How many equal parts?",
+                                    minvalue=1, maxvalue=100, parent=root)
+        if not n:
+            return
+        segments.clear()
+        for i in range(n):
+            segments.append([dur * i / n, dur * (i + 1) / n])
+        selected["index"] = 0
+        refresh_segments()
+        update_preview()
+
+    def split_files():
+        if not need(cut_file):
+            return
+        n = simpledialog.askinteger("Split into files", "How many equal parts?",
+                                    minvalue=2, maxvalue=100, parent=root)
+        if not n:
+            return
+        src = cut_file["path"]
+        outdir = outdir_var.get().strip() if use_outdir.get() else os.path.dirname(os.path.abspath(src))
+        is_exact = exact.get()
+
+        def work(job):
+            paths = engine.split(src, outdir, n, job, is_exact)
+            return paths[0] if paths else outdir
+        start(work, "Splitting...")
 
     def on_cut_file(info):
-        start_var.set("0:00")
-        end_var.set(format_time(info.duration) if info.duration else "end")
-    times.pack(fill="x", pady=(0, 10))
-    ttk.Label(times, text="From").pack(side="left")
-    ttk.Entry(times, textvariable=start_var, width=12).pack(side="left", padx=6)
-    ttk.Label(times, text="to").pack(side="left")
-    ttk.Entry(times, textvariable=end_var, width=12).pack(side="left", padx=6)
-    mode = tk.StringVar(value="keep")
-    ttk.Radiobutton(t_cut, text="Keep this part", variable=mode, value="keep").pack(anchor="w")
-    ttk.Radiobutton(t_cut, text="Remove this part (keep the rest)", variable=mode, value="remove").pack(anchor="w")
-    ttk.Radiobutton(t_cut, text="Split into equal parts", variable=mode, value="split").pack(anchor="w")
-    parts_row = ttk.Frame(t_cut)
-    parts_row.pack(fill="x", pady=(4, 0))
-    ttk.Label(parts_row, text="Number of parts:").pack(side="left")
-    parts_var = tk.StringVar(value="2")
-    parts_entry = ttk.Entry(parts_row, textvariable=parts_var, width=6)
-    parts_entry.pack(side="left", padx=6)
-
-    def on_mode(*_):
-        try:
-            parts_entry.configure(state="normal" if mode.get() == "split" else "disabled")
-        except tk.TclError:
-            pass
-    mode.trace_add("write", on_mode)
-    on_mode()
-
-    exact = tk.BooleanVar(value=False)
-    ttk.Checkbutton(t_cut, text="Frame-exact (slower, re-encodes)", variable=exact).pack(anchor="w", pady=(8, 0))
-    wrapping_label(t_cut, hint=True,
-                   text="Left off, cuts are instant and lossless but start at the nearest keyframe, "
-                        "which can be up to a few seconds early. Split writes one file per part.").pack(fill="x", pady=(4, 0))
-    cut_file, cut_set = file_picker(t_cut, on_cut_file)
+        cut_name_var.set(os.path.basename(cut_file["path"]) if cut_file["path"] else "")
+        segments.clear()
+        if info.duration:
+            segments.append([0.0, info.duration])
+        selected["index"] = 0
+        refresh_segments()
+        update_preview()
 
     def do_cut():
         if not need(cut_file):
             return
+        if not segments:
+            messagebox.showinfo(APP_NAME, "Add a segment first.")
+            return
         src = cut_file["path"]
-        if mode.get() == "split":
-            try:
-                parts = int(parts_var.get())
-            except ValueError:
-                messagebox.showerror(APP_NAME, "Enter a whole number of parts.")
-                return
-            if parts < 2:
-                messagebox.showerror(APP_NAME, "Split needs at least 2 parts.")
-                return
-            outdir = outdir_var.get().strip() if use_outdir.get() else os.path.dirname(os.path.abspath(src))
-            is_exact = exact.get()
-            start(lambda job: engine.split(src, outdir, parts, job, is_exact), "Splitting...")
-            return
-        try:
-            a = parse_time(start_var.get())
-            end_text = end_var.get().strip().lower()
-            b = (cut_file["info"].duration or 1e7) if end_text in ("", "end") else parse_time(end_text)
-        except ValueError as e:
-            messagebox.showerror(APP_NAME, str(e))
-            return
         dst = destination(src, "cut")
-        remove = mode.get() == "remove"
+        segs = [tuple(s) for s in segments]
+        remove = remove_mode.get()
         is_exact = exact.get()
-        start(lambda job: engine.cut(src, dst, a, b, job, remove, is_exact), "Cutting...")
-    big_button(t_cut, "Cut", do_cut)
+        label = "Removing parts..." if remove else (
+            "Merging segments..." if len(segs) > 1 else "Cutting...")
+        start(lambda job: engine.cut_segments(src, dst, segs, job, is_exact, remove), label)
+
+    cut_file, cut_set = file_picker(t_cut, on_cut_file)
+    header.pack(fill="x", pady=(0, 4))
+    main.pack(fill="both", expand=True)
+    list_frame.pack(side="left", fill="both", expand=True)
+    preview_frame.pack(side="left", fill="y")
+    timeline.pack(fill="x", pady=(6, 0))
+    btns_cut.pack(fill="x", pady=(6, 0))
+    ttk.Button(btns_cut, text="Add segment", command=add_segment).pack(side="left")
+    ttk.Button(btns_cut, text="Edit", command=edit_segment).pack(side="left", padx=4)
+    ttk.Button(btns_cut, text="Remove", command=remove_segment).pack(side="left")
+    ttk.Button(btns_cut, text="Split into N...", command=split_equal).pack(side="left", padx=4)
+    ttk.Button(btns_cut, text="Save N files", command=split_files).pack(side="left", padx=4)
+    ttk.Button(btns_cut, text="Merge", command=do_cut).pack(side="right")
+    checks_cut.pack(fill="x", pady=(4, 0))
+    ttk.Checkbutton(checks_cut, text="Frame-exact (re-encodes)", variable=exact).pack(side="left")
+    ttk.Checkbutton(checks_cut, text="Remove these parts", variable=remove_mode).pack(side="left", padx=(8, 0))
+    big_button(t_cut, "Start", do_cut)
 
     # -- Join ---------------------------------------------------------------
     t_join = tab("  Join  ", "Join several videos end to end, in the order shown. Matching files "
