@@ -82,6 +82,21 @@ def avi(ffmpeg, media_dir):
 
 
 @pytest.fixture(scope="session")
+def sub_mkv(ffmpeg, media_dir):
+    """A 2 second MKV with video, audio and a subtitle stream."""
+    srt = media_dir / "sub.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello subtitle\n", encoding="utf-8")
+    path = media_dir / "sample_sub.mkv"
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "testsrc=s=320x240:d=2",
+           "-f", "lavfi", "-i", "sine=d=2",
+           "-i", str(srt),
+           "-c:v", "wmv2", "-c:a", "wmav2", "-c:s", "srt", str(path), "-y"]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    return str(path)
+
+
+@pytest.fixture(scope="session")
 def ts_supported(engine, ffmpeg, media_dir):
     """Some static FFmpeg builds crash on MPEG-TS; skip that check if so."""
     path = media_dir / "ts-check.ts"

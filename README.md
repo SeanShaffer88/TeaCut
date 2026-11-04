@@ -45,15 +45,19 @@ underneath, so it opens practically anything:
 
 | Tab | What it's for |
 |-----|---------------|
-| ✂️ **Cut** | Keep a section, or remove a section and keep the rest. Instant and lossless by default; tick *Frame-exact* to cut on the exact frame. |
+| ✂️ **Cut** | Build a segment list: keep several parts and join them, or remove parts and keep the rest. Add, edit or split segments, see the total and a timeline, then press *Start*. Split into equal parts or write one file per part. Instant and lossless by default; tick *Frame-exact* to cut on the exact frame. |
 | ➕ **Join** | Put several videos end to end, in the order shown. Matching files join losslessly in seconds; mismatched files (different sizes, formats, or some without sound) are converted to match automatically. Add a whole folder at once, or drop files onto the window. |
 | 🩹 **Repair** | Fixes videos that won't open, can't seek, show the wrong length, stutter or stop early. The quick fix rebuilds the file losslessly; *Deep repair* re-encodes and rebuilds every timestamp for badly damaged files. |
-| 🔄 **Convert** | MP4, MKV, WebM, MOV, AVI, WMV, ASF, MPEG-2, TS, FLV, M4V, 3GP or OGV. Any stream the new format already supports is copied untouched; only the rest is converted. |
+| 🔄 **Convert** | MP4, MKV, WebM, MOV, AVI, WMV, ASF, MPEG-2, TS, FLV, M4V, 3GP or OGV. Any stream the new format already supports is copied untouched; only the rest is converted. Choose a quality and size, or mute the audio. |
+| 📦 **Batch** | Convert or repair a whole list of files one after another, with a per-file status. Add files or a folder, choose the action, and press *Start batch*. |
 
 * **Lossless first.** Whenever it can, TeaCut copies the video data as-is, with no quality loss. It re-encodes only when there's no other way.
 * **Nothing is overwritten.** Results are saved next to the original, e.g. `holiday_cut.mp4`. Tick *Save results in* at the bottom of the window to put them in a folder of your choice instead (TeaCut remembers it).
+* **A segment list, not a single range.** The Cut tab shows every kept part with its start, end and duration, the total, and a timeline. Add, edit, remove or split segments, then press *Start* to merge them into one file.
+* **A preview before you commit.** Each file row shows a small frame from the video, and the Cut tab previews the selected segment.
 * **No setup.** The Windows `.exe` has FFmpeg built in. Download it and run it.
 * **Light and dark mode.** A Windows 11 style look that follows your system setting, with a switch to flip it. TeaCut remembers your choice.
+* **Progress you can read.** The bar shows time remaining and speed (e.g. `0:12 left · 2.3x`), and *Details* opens the FFmpeg log if something goes wrong.
 
 ## Download (Windows)
 
@@ -76,9 +80,10 @@ The same engine is available from a terminal:
 
 ```
 python teacut.py cut video.wmv --start 1:30 --end 2:45 [--remove] [--exact]
+python teacut.py split video.wmv --parts 4 [--exact] [--output-dir parts]
 python teacut.py join part1.mp4 part2.mp4 part3.avi -o all.mp4
 python teacut.py repair broken.asf [--deep]
-python teacut.py convert old.wmv -o new.mp4
+python teacut.py convert old.wmv -o new.mp4 [--quality smaller|balanced|high] [--scale 720] [--mute]
 python teacut.py info video.mkv
 ```
 
@@ -86,6 +91,7 @@ Times can be written as `90`, `1:30`, `01:02:03.5` or `1m30s`.
 Add `--output-dir DIR` to any of the commands that write a file to put the result
 in that folder instead of next to the source (the folder is created if needed).
 With `convert`, a bare `-o name.mp4` is placed in `--output-dir` too.
+`--scale` downscales to the given height (never upscales), and `--mute` drops the audio.
 
 ## Development
 
@@ -97,9 +103,10 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest
 ```
 
-The suite covers the time/format helpers, probing, cutting (lossless, frame-exact
-and remove), joining (matching and mismatched files), repairing (including a
-truncated file), converting to the supported formats, and the command line.
+The suite covers the time/format helpers, probing, cutting (lossless, frame-exact,
+remove and split), joining (matching and mismatched files), repairing (including a
+truncated file), converting to the supported formats (including quality, scaling,
+mute and subtitle preservation), thumbnails, and the command line.
 [.github/workflows/tests.yml](.github/workflows/tests.yml) runs it on Linux,
 Windows and macOS for Python 3.11 and 3.12.
 

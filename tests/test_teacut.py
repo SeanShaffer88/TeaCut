@@ -55,6 +55,17 @@ def test_format_time_clamps_negative():
     assert teacut.format_time(-5) == "0:00"
 
 
+@pytest.mark.parametrize("secs,expected", [
+    (0, "0:00:00.00"),
+    (4.51, "0:00:04.51"),
+    (18.04, "0:00:18.04"),
+    (59.999, "0:01:00.00"),
+    (3723.5, "1:02:03.50"),
+])
+def test_format_time_long(secs, expected):
+    assert teacut.format_time_long(secs) == expected
+
+
 def test_ext():
     assert teacut._ext("movie.MP4") == "mp4"
     assert teacut._ext("movie") == "mkv"
@@ -188,6 +199,37 @@ def test_cut_creates_output_folder(engine, wmv, tmp_path, job):
     assert os.path.isfile(dst)
 
 
+def test_cut_segments_keep(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "segments.wmv")
+    engine.cut_segments(wmv, dst, [(0, 2), (4, 6)], job)
+    assert os.path.getsize(dst) > 1024
+    assert 3.5 < engine.probe(dst).duration < 5.0
+
+
+def test_cut_segments_remove(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "segments_removed.wmv")
+    engine.cut_segments(wmv, dst, [(2, 4)], job, remove=True)
+    assert os.path.getsize(dst) > 1024
+    assert 3.5 < engine.probe(dst).duration < 5.0
+
+
+def test_cut_segments_single(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "one_segment.wmv")
+    engine.cut_segments(wmv, dst, [(1, 3)], job)
+    assert 1.5 < engine.probe(dst).duration < 3.0
+
+
+def test_cut_segments_remove_all(engine, wmv, tmp_path, job):
+    with pytest.raises(teacut.TeaCutError):
+        engine.cut_segments(wmv, str(tmp_path / "bad.wmv"), [(0, 100)], job, remove=True)
+
+
+def test_complement():
+    assert teacut._complement([(1, 2), (3, 4)], 5) == [(0, 1), (2, 3), (4, 5)]
+    assert teacut._complement([(0, 5)], 5) == []
+    assert teacut._complement([(0, 2), (1, 3)], 4) == [(3, 4)]
+
+
 # ---------------------------------------------------------------------------
 # Join
 # ---------------------------------------------------------------------------
@@ -264,6 +306,84 @@ def test_convert_reencode(engine, wmv, tmp_path, job):
     info = engine.probe(dst)
     assert info.vcodec in ("h264", "mpeg4")
     assert info.acodec == "aac"
+
+
+def test_convert_quality_and_mute(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "small.mp4")
+    engine.convert(wmv, dst, job, quality="smaller", scale_height=240, mute=True)
+    info = engine.probe(dst)
+    assert info.has_video
+    assert not info.has_audio
+    assert info.height <= 240
+
+
+def test_convert_scale_down(engine, avi, tmp_path, job):
+    dst = str(tmp_path / "down.mp4")
+    engine.convert(avi, dst, job, scale_height=240)
+    info = engine.probe(dst)
+    assert info.height == 240
+    assert info.width == 426
+
+
+def test_convert_never_upscales(engine, wmv, tmp_path, job):
+    dst = str(tmp_path / "up.mp4")
+    engine.convert(wmv, dst, job, scale_height=1080)
+    info = engine.probe(dst)
+    assert info.height == 240
+
+
+def test_convert_keeps_subtitles_in_mkv(engine, sub_mkv, tmp_path, job):
+    dst = str(tmp_path / "sub.mkv")
+    engine.convert(sub_mkv, dst, job)
+    info = engine.probe(dst)
+    assert info.has_subtitles
+
+
+def test_convert_keeps_subtitles_when_reencoding(engine, sub_mkv, tmp_path, job):
+    dst = str(tmp_path / "sub_reencoded.mkv")
+    engine.convert(sub_mkv, dst, job, force_encode=True)
+    info = engine.probe(dst)
+    assert info.has_subtitles
+
+
+def test_split(engine, wmv, tmp_path, job):
+    outdir = tmp_path / "parts"
+    paths = engine.split(wmv, str(outdir), 3, job)
+    assert len(paths) == 3
+    for path in paths:
+        assert os.path.isfile(path)
+        assert os.path.getsize(path) > 1024
+        info = engine.probe(path)
+        assert 0.5 < info.duration < 4.0
+
+
+def test_split_exact(engine, wmv, tmp_path, job):
+    outdir = tmp_path / "parts_exact"
+    paths = engine.split(wmv, str(outdir), 2, job, exact=True)
+    assert len(paths) == 2
+    for path in paths:
+        assert os.path.isfile(path)
+        info = engine.probe(path)
+        assert 2.5 < info.duration < 3.5
+
+
+def test_split_rejects_bad_parts(engine, wmv, tmp_path, job):
+    with pytest.raises(teacut.TeaCutError):
+        engine.split(wmv, str(tmp_path), 1, job)
+    with pytest.raises(teacut.TeaCutError):
+        engine.split(wmv, str(tmp_path), 100, job)
+
+
+def test_extract_frame(ffmpeg, wmv, tmp_path):
+    dst = str(tmp_path / "frame.png")
+    assert teacut.extract_frame(ffmpeg, wmv, dst, 1.0) == dst
+    assert os.path.getsize(dst) > 100
+
+
+def test_extract_frame_no_video(ffmpeg, tmp_path):
+    path = tmp_path / "silent.mka"
+    path.write_bytes(b"not a video")
+    assert teacut.extract_frame(ffmpeg, str(path), str(tmp_path / "no.png"), 0.0) is None
 
 
 @pytest.mark.parametrize("ext", sorted(teacut.FORMATS))
@@ -352,6 +472,24 @@ def test_cli_convert_output_dir(wmv, tmp_path):
     result = run_cli("convert", wmv, "-o", "cli_convert.mp4", "--output-dir", str(outdir))
     assert result.returncode == 0, result.stderr
     assert (outdir / "cli_convert.mp4").is_file()
+
+
+def test_cli_convert_presets(wmv, tmp_path):
+    out = str(tmp_path / "cli_small.mp4")
+    result = run_cli("convert", wmv, "-o", out, "--quality", "smaller",
+                     "--scale", "240", "--mute")
+    assert result.returncode == 0, result.stderr
+    assert os.path.isfile(out)
+    info = teacut.Engine().probe(out)
+    assert info.height <= 240
+    assert not info.has_audio
+
+
+def test_cli_split(wmv, tmp_path):
+    outdir = tmp_path / "parts"
+    result = run_cli("split", wmv, "--parts", "3", "--output-dir", str(outdir))
+    assert result.returncode == 0, result.stderr
+    assert len(list(outdir.glob("sample_part*.wmv"))) == 3
 
 
 def test_cli_bad_time(wmv, tmp_path):
