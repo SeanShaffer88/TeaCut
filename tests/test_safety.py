@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import teacut
@@ -101,7 +102,18 @@ class SafetyTests(unittest.TestCase):
             try:
                 worker.request('widget', 'old'); self.assertTrue(started.wait(2))
                 worker.request('widget', 'middle'); worker.request('widget', 'latest')
+                self.assertEqual(worker.take(), [])
                 release.set(); self.assertTrue(finished.wait(2))
+                delivered = []
+                deadline = time.monotonic() + 2
+                while not delivered and time.monotonic() < deadline:
+                    delivered.extend(worker.take())
+                    time.sleep(0.001)
+                self.assertEqual(len(delivered), 1)
+                self.assertEqual((delivered[0][0], delivered[0][2]), ('widget', True))
+                self.assertTrue(delivered[0][1].endswith('_3.png'))
+                self.assertEqual(Path(delivered[0][1]).read_bytes(), b'png')
+                self.assertEqual(worker.take(), [])
             finally:
                 release.set(); worker.stop()
             self.assertEqual(calls, ['old', 'latest'])
