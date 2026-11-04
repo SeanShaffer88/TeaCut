@@ -169,12 +169,65 @@ def extract_frame(ffmpeg, src, dst, at_seconds=1.0, width=160):
         result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                 creationflags=_NO_WINDOW, text=True,
-                                encoding="utf-8", errors="replace")
-    except OSError:
+                                encoding="utf-8", errors="replace", timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0 or not os.path.isfile(dst) or os.path.getsize(dst) < 100:
         return None
     return dst
+
+
+class PreviewWorker:
+    def __init__(self, ffmpeg):
+        self.ffmpeg = ffmpeg
+        self.directory = tempfile.mkdtemp(prefix="teacut_preview_")
+        self.condition = threading.Condition()
+        self.pending, self.results, self.generations = {}, {}, {}
+        self.stopped = False
+        self.thread = threading.Thread(target=self._work, daemon=True)
+        self.thread.start()
+
+    def request(self, key, src, at=0.0, width=160):
+        with self.condition:
+            generation = self.generations.get(key, 0) + 1
+            self.generations[key] = generation
+            self.pending[key] = (generation, src, at, width)
+            self.condition.notify()
+
+    def _work(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.stopped or self.pending)
+                if self.stopped:
+                    return
+                key = next(iter(self.pending))
+                generation, src, at, width = self.pending.pop(key)
+            path = os.path.join(self.directory, f"{id(key)}_{generation}.png")
+            result = extract_frame(self.ffmpeg, src, path, at, width) if src else None
+            with self.condition:
+                if not self.stopped and self.generations[key] == generation:
+                    old = self.results.pop(key, None)
+                    if old and old[1]:
+                        os.remove(old[1])
+                    self.results[key] = (generation, result)
+                    if result:
+                        continue
+            if os.path.exists(path):
+                os.remove(path)
+
+    def take(self):
+        with self.condition:
+            results, self.results = self.results, {}
+            return [(key, path, generation == self.generations[key])
+                    for key, (generation, path) in results.items()]
+
+    def stop(self):
+        with self.condition:
+            self.stopped = True
+            self.pending.clear()
+            self.condition.notify()
+        self.thread.join()
+        shutil.rmtree(self.directory)
 
 
 def _complement(segments, duration):
@@ -309,6 +362,25 @@ class Engine:
 
     # -- running ------------------------------------------------------------
     def run(self, args, job, total_seconds=0.0, span=(0.0, 1.0)):
+        dst = args[-1]
+        ensure_parent(dst)
+        folder = tempfile.mkdtemp(prefix=".teacut_output_", dir=os.path.dirname(os.path.abspath(dst)))
+        stage = os.path.join(folder, "output" + os.path.splitext(dst)[1])
+        try:
+            self._run(args[:-1] + [stage], job, total_seconds, span)
+            if not _looks_ok(self, stage):
+                raise TeaCutError("FFmpeg produced an unreadable or empty output.")
+            with job._lock:
+                if job.cancelled:
+                    raise Cancelled("Cancelled.")
+                try:
+                    os.link(stage, dst)
+                except OSError as e:
+                    raise TeaCutError(f"Cannot publish output without replacing an existing file: {dst}: {e}") from e
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def _run(self, args, job, total_seconds=0.0, span=(0.0, 1.0)):
         """Run ffmpeg with progress reporting. Raises TeaCutError on failure."""
         # Every call ends with the output path; make its folder first so a
         # chosen destination doesn't fail with a cryptic FFmpeg error.
@@ -320,10 +392,15 @@ class Engine:
                 raise TeaCutError(f"Cannot create the output folder for {out}: {e}")
         cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"] + args
         job.log(" ".join(_quote(a) for a in cmd))
+        if job.cancelled:
+            raise Cancelled("Cancelled.")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW,
                                 text=True, encoding="utf-8", errors="replace")
-        job.proc = proc
+        with job._lock:
+            job.proc = proc
+            if job.cancelled:
+                proc.kill()
         err_lines = []
 
         def drain():
@@ -335,27 +412,35 @@ class Engine:
         start, width = span
         start_wall = time.time()
         runaway = False
-        for line in proc.stdout:
-            if job.cancelled:
-                break
-            if line.startswith("out_time_us=") and total_seconds > 0:
-                try:
-                    secs = int(line.split("=", 1)[1]) / 1e6
-                except ValueError:
-                    continue
-                elapsed = time.time() - start_wall
-                speed = secs / elapsed if elapsed > 0.05 else 0.0
-                eta = (total_seconds - secs) / speed if speed > 0 else None
-                job.progress(start + width * max(0.0, min(1.0, secs / total_seconds)),
-                             {"done": secs, "total": total_seconds, "speed": speed, "eta": eta})
-                if secs > total_seconds * 2 + 30:
-                    runaway = True
+        try:
+            for line in proc.stdout:
+                if job.cancelled:
                     break
-        if job.cancelled or runaway:
-            proc.kill()
-        proc.wait()
-        t.join(timeout=2)
-        job.proc = None
+                if line.startswith("out_time_us=") and total_seconds > 0:
+                    try:
+                        secs = int(line.split("=", 1)[1]) / 1e6
+                    except ValueError:
+                        continue
+                    elapsed = time.time() - start_wall
+                    speed = secs / elapsed if elapsed > 0.05 else 0.0
+                    eta = (total_seconds - secs) / speed if speed > 0 else None
+                    job.progress(start + width * max(0.0, min(1.0, secs / total_seconds)),
+                                 {"done": secs, "total": total_seconds, "speed": speed, "eta": eta})
+                    if secs > total_seconds * 2 + 30:
+                        runaway = True
+                        break
+            if job.cancelled or runaway:
+                proc.kill()
+            proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            t.join()
+            proc.stdout.close()
+            proc.stderr.close()
+            with job._lock:
+                job.proc = None
         if job.cancelled:
             raise Cancelled("Cancelled.")
         if runaway:
@@ -546,6 +631,7 @@ class Engine:
             job.status("Cutting...")
             self._cut_piece(src, dst, pieces[0][0], pieces[0][1], info, job, exact, (0.0, 1.0))
             return dst
+        ensure_parent(dst)
         tmp = tempfile.mkdtemp(prefix=".teacut_", dir=os.path.dirname(os.path.abspath(dst)))
         try:
             parts = []
@@ -591,6 +677,7 @@ class Engine:
             job.status("Cutting..." + (" (frame-exact)" if exact else ""))
             self._cut_piece(src, dst, segs[0][0], segs[0][1], info, job, exact, (0.0, 1.0))
             return dst
+        ensure_parent(dst)
         tmp = tempfile.mkdtemp(prefix=".teacut_", dir=os.path.dirname(os.path.abspath(dst)))
         try:
             parts = []
@@ -821,6 +908,7 @@ class Job:
     """Progress/cancel plumbing between the engine and whoever is watching."""
 
     def __init__(self, on_progress=None, on_status=None, on_log=None):
+        self._lock = threading.Lock()
         self.proc = None
         self.cancelled = False
         self._p, self._s, self._l = on_progress, on_status, on_log
@@ -838,12 +926,14 @@ class Job:
             self._l(text)
 
     def cancel(self):
-        self.cancelled = True
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
+        with self._lock:
+            self.cancelled = True
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1184,23 @@ def gui():
         label.bind("<Configure>", lambda e: label.configure(wraplength=max(200, e.width - 4)))
         return label
 
+    previews = PreviewWorker(engine.ffmpeg)
+
+    def pump_previews():
+        for widget, path, current in previews.take():
+            try:
+                if current:
+                    img = tk.PhotoImage(file=path) if path else None
+                    widget.configure(image=img or "", text="" if img else "No preview")
+                    widget.image = img
+            except tk.TclError:
+                widget.configure(image="", text="No preview")
+            finally:
+                if path:
+                    os.remove(path)
+        root.after(50, pump_previews)
+    root.after(50, pump_previews)
+
     events = queue.Queue()
     state = {"job": None, "last_output": None}
     filetypes = [("Video files", " ".join(f"*.{e}" for e in VIDEO_EXTENSIONS)
@@ -1333,7 +1440,6 @@ def gui():
         name = tk.StringVar(value="No file chosen" + (" - or drop one here" if DND_FILES else ""))
         details = tk.StringVar(value="Works with MP4, MKV, AVI, MOV, WMV, ASF, FLV, WebM, MPEG, TS, 3GP and more.")
         thumb = ttk.Label(row, text="")
-        thumb_path = os.path.join(tempfile.gettempdir(), f"teacut_thumb_{id(holder)}.png")
 
         def set_path(path):
             try:
@@ -1344,24 +1450,8 @@ def gui():
             holder["path"], holder["info"] = path, info
             name.set(os.path.basename(path))
             details.set(info.summary())
-            try:
-                os.remove(thumb_path)
-            except OSError:
-                pass
-            if info.has_video and engine.ffmpeg:
-                at = min(1.0, info.duration / 2) if info.duration else 0.0
-                extract_frame(engine.ffmpeg, path, thumb_path, at)
-            try:
-                if os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 100:
-                    img = tk.PhotoImage(file=thumb_path)
-                    holder["image"] = img
-                    thumb.configure(image=img, text="")
-                else:
-                    holder["image"] = None
-                    thumb.configure(image="", text="no preview")
-            except tk.TclError:
-                holder["image"] = None
-                thumb.configure(image="", text="no preview")
+            at = min(1.0, info.duration / 2) if info.duration else 0.0
+            previews.request(thumb, path if info.has_video else None, at)
             on_change(info)
 
         def choose():
@@ -1457,29 +1547,14 @@ def gui():
 
     def update_preview():
         if not segments or not cut_file["path"]:
+            previews.request(preview_label, None)
             preview_label.configure(image="", text="No preview")
             preview_info.configure(text="")
             return
         i = min(selected["index"], len(segments) - 1)
         a, b = segments[i]
         at = a + min(1.0, max(0.0, (b - a) / 2))
-        path = os.path.join(tempfile.gettempdir(), f"teacut_seg_{os.getpid()}_{i}.png")
-        old = getattr(preview_label, "image_path", None)
-        if extract_frame(engine.ffmpeg, cut_file["path"], path, at, width=240):
-            try:
-                img = tk.PhotoImage(file=path)
-                preview_label.configure(image=img, text="")
-                preview_label.image = img
-                preview_label.image_path = path
-            except tk.TclError:
-                preview_label.configure(image="", text="No preview")
-        else:
-            preview_label.configure(image="", text="No preview")
-        if old and old != path:
-            try:
-                os.remove(old)
-            except OSError:
-                pass
+        previews.request(preview_label, cut_file["path"], at, width=240)
         preview_info.configure(text=f"{format_time_long(a)} - {format_time_long(b)}")
 
     def redraw_timeline():
@@ -2022,6 +2097,7 @@ def gui():
             if not messagebox.askyesno(APP_NAME, "A job is still running. Stop it and quit?"):
                 return
             state["job"].cancel()
+        previews.stop()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
     apply_theme()

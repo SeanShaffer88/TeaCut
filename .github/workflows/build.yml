@@ -3,8 +3,14 @@ name: Build TeaCut.exe
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the source version (requires explicit release approval)
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -57,13 +63,17 @@ jobs:
           path: dist/TeaCut.exe
 
       - name: Publish release (when VERSION in teacut.py is new)
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(python -c "import re; print(re.search(r'^VERSION = \"(.+?)\"', open('teacut.py').read(), re.M).group(1))")
           tag="v$version"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag does not match source VERSION" >&2
+            exit 1
+          fi
           if gh release view "$tag" > /dev/null 2>&1; then
             echo "Release $tag already exists - bump VERSION in teacut.py to publish a new one."
             exit 0
